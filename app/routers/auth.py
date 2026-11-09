@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import jwt
 from fastapi import APIRouter, Request, Form, HTTPException
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.config import (
     JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_DAYS, ROLE_NAMES, ROLE_HOME,
@@ -65,7 +65,7 @@ def _log_login_attempt(username, ip, user_agent, success, reason=""):
     )
 
 
-def _build_session_user(user, request) -> dict:
+def _build_session_user(user, request, device_uuid=None) -> dict:
     """Build session user dict with device + audit info."""
     role, role_id = _resolve_role(user)
     return {
@@ -78,10 +78,74 @@ def _build_session_user(user, request) -> dict:
         "townshipID": user.get("townshipID"),
         # 🔍 Audit fields for shared accounts
         "device_id": _get_device_id(request),
+        "device_uuid": device_uuid,
         "login_ip": _get_client_ip(request),
         "login_ua": (request.headers.get("user-agent") or "")[:200],
         "login_at": datetime.utcnow().isoformat(),
     }
+
+
+def _clean_device_uuid(value) -> str | None:
+    """Return a canonical UUID string, or None when the value is missing/invalid."""
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(str(value).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _ensure_enumerator_device(user_id, platform, device_name=None, device_uuid=None) -> str | None:
+    """Reuse or create a device UUID and link it to this enumerator account.
+
+    The browser/mobile client keeps the UUID in local storage, so the same
+    device UUID follows the user between accounts.  ``sync_devices`` is keyed by
+    ``(device_id, userID)``: one physical device can therefore have one row per
+    enumerator account, while an existing row for the same user is not duplicated.
+    """
+    existing = _clean_device_uuid(device_uuid)
+    device_id = existing or str(uuid.uuid4())
+
+    conn = cursor = None
+    persisted = False
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM sync_devices "
+            "WHERE device_id = %s AND userID = %s LIMIT 1",
+            (device_id, user_id),
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "INSERT INTO sync_devices "
+                "(device_id, userID, platform, device_name, status) "
+                "VALUES (%s, %s, %s, %s, 1) "
+                "ON DUPLICATE KEY UPDATE device_id = VALUES(device_id)",
+                (
+                    device_id,
+                    user_id,
+                    platform,
+                    (device_name or "")[:100] or None,
+                ),
+            )
+            conn.commit()
+        persisted = True
+    except Exception:
+        logger.exception(
+            "Failed to register enumerator device %s for user %s", device_id, user_id
+        )
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+    # Do not ask the client to keep a UUID that was not recorded server-side;
+    # the next login will try again.
+    return device_id if persisted else None
 
 
 def _fetch_user_by_login(username: str):
@@ -115,7 +179,12 @@ def _fetch_user_by_login(username: str):
 # ============================================================
 @router.post("/api/login")
 @limiter.limit("40/10 minute")
-async def web_login(request: Request, username: str = Form(...), password: str = Form(...)):
+async def web_login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    device_uuid: str = Form(None),
+):
     username = username.strip()
     ip = _get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
@@ -143,13 +212,27 @@ async def web_login(request: Request, username: str = Form(...), password: str =
 
     role, _ = _resolve_role(user)
 
+    # Enumerator clients keep a device UUID in local storage. Reuse it for the
+    # current account, adding a sync_devices row only when this (device, user)
+    # pair has not been recorded before.
+    enumerator_device_uuid = None
+    if role == "enumerator":
+        enumerator_device_uuid = _ensure_enumerator_device(
+            user_id=user["id"],
+            platform="web",
+            device_name=request.headers.get("user-agent"),
+            device_uuid=device_uuid,
+        )
+
     # Preserve device_id across session clear (same browser = same device)
     existing_device_id = request.session.get("device_id")
     request.session.clear()
     request.session["device_type"] = "web"
     if existing_device_id:
         request.session["device_id"] = existing_device_id
-    request.session["user"] = _build_session_user(user, request)
+    request.session["user"] = _build_session_user(
+        user, request, device_uuid=enumerator_device_uuid
+    )
 
     _log_login_attempt(username, ip, user_agent, True, "web_login_success")
 
@@ -158,6 +241,7 @@ async def web_login(request: Request, username: str = Form(...), password: str =
         "role": role,
         "redirect": ROLE_HOME.get(role, "/survey/part1"),
         "device_id": request.session.get("device_id"),
+        "device_uuid": enumerator_device_uuid,
     }
 
 
@@ -166,7 +250,12 @@ async def web_login(request: Request, username: str = Form(...), password: str =
 # ============================================================
 @router.post("/api/mobile/login")
 @limiter.limit("40/10 minute")
-async def mobile_login(request: Request, username: str = Form(...), password: str = Form(...)):
+async def mobile_login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    device_uuid: str = Form(None),
+):
     username = username.strip()
     ip = _get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
@@ -193,6 +282,16 @@ async def mobile_login(request: Request, username: str = Form(...), password: st
         raise HTTPException(403, "သင့်အကောင့်ကို အသုံးပြုခွင့် ပိတ်ထားပါသည်။")
 
     role, role_id = _resolve_role(user)
+
+    enumerator_device_uuid = None
+    if role == "enumerator":
+        enumerator_device_uuid = _ensure_enumerator_device(
+            user_id=user["id"],
+            platform="mobile",
+            device_name=request.headers.get("user-agent"),
+            device_uuid=device_uuid,
+        )
+
     now = datetime.utcnow()
     payload = {
         "user_id": user["id"],
@@ -203,6 +302,7 @@ async def mobile_login(request: Request, username: str = Form(...), password: st
         "districtID": user.get("districtID"),
         "townshipID": user.get("townshipID"),
         "device_id": _get_device_id(request),
+        "device_uuid": enumerator_device_uuid,
         "ip": ip,
         "iat": now,
         "exp": now + timedelta(days=JWT_EXPIRATION_DAYS),
@@ -211,12 +311,13 @@ async def mobile_login(request: Request, username: str = Form(...), password: st
 
     _log_login_attempt(username, ip, user_agent, True, "mobile_login_success")
 
-    response = Response(
+    response = JSONResponse(
         content={
             "status": "success",
             "token": token,
             "role": role,
             "redirect": ROLE_HOME.get(role, "/survey/part1"),
+            "device_uuid": enumerator_device_uuid,
         },
         status_code=200,
         headers={"Set-Cookie": f"moali_session={token}; Path=/; HttpOnly"},
