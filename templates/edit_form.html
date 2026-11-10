@@ -647,11 +647,11 @@
         <table class="table table-bordered table-hover align-middle bg-white" id="collectedTable">
             <thead style="background:#ecfdf5; color:#065f46;">
                 <tr>
-                    <th>Animal Type ID</th>
-                    <th>Animal ID</th>
-                    <th>Species ID</th>
-                    <th>Age ID</th>
-                    <th>Gender ID</th>
+                    <th>တိရစ္ဆာန်အမျိုးအစား</th>
+                    <th>တိရစ္ဆာန်အမည်</th>
+                    <th>မျိုးစိတ်</th>
+                    <th>အသက်</th>
+                    <th>အထီး/အမ</th>
                     <th>အရေအတွက်</th>
                     <th>လုပ်ဆောင်ချက်</th>
                 </tr>
@@ -870,7 +870,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 <td>${f.formID || '-'}</td>
                 <td>${f.headName || '-'}</td>
                 <td>${f.householdNo || '-'}</td>
-                <td>${f.QVName || '-'}${f.WardName ? ' / ' + f.WardName : ''}</td>
+                <td>${f.QVName || '-'}${f.VillageName ? ' / ' + f.VillageName : ''}</td>
                 <td>${f.interviewDate || '-'}</td>
                 <td>${statusBadge}</td>
                 <td class="text-center">

@@ -147,7 +147,8 @@ async def get_form_for_edit(formID: str, request: Request):
     conn = get_db_connection(); cur = conn.cursor(dictionary=True)
     try:
         cur.execute("""
-            SELECT p.*, s.stateName, d.districtName, t.townshipName, q.QVName
+            SELECT p.*, s.stateName, d.districtName, t.townshipName, q.QVName,
+                   v.villageName as VillageName
             FROM personcv p
             LEFT JOIN state    s ON s.stateID = p.stateID
             LEFT JOIN district d ON d.stateID = p.stateID AND d.districtID = p.districtID
@@ -155,6 +156,11 @@ async def get_form_for_edit(formID: str, request: Request):
                                 AND t.townshipID = p.townshipID
             LEFT JOIN qv       q ON q.stateID = p.stateID AND q.districtID = p.districtID
                                 AND q.townshipID = p.townshipID AND q.QVID = p.QVID
+            LEFT JOIN village  v ON v.villageID = p.WardName
+                                AND v.stateID = p.stateID
+                                AND v.districtID = p.districtID
+                                AND v.townshipID = p.townshipID
+                                AND v.QVID = p.QVID
             WHERE p.formID = %s AND p.userId = %s LIMIT 1
         """, (formID, user_id))
         person = cur.fetchone()
@@ -266,10 +272,16 @@ async def get_my_forms(
     try:
         sql = """
             SELECT p.formID, p.name, p.householdNo, p.interviewDate, p.WardName,
-                   q.QVName, p.Interviewer, p.headName, p.status
+                   q.QVName, v.villageName as VillageName,
+                   p.Interviewer, p.headName, p.status
             FROM personcv p
             LEFT JOIN qv q ON q.QVID = p.QVID AND q.stateID = p.stateID
                          AND q.districtID = p.districtID AND q.townshipID = p.townshipID
+            LEFT JOIN village v ON v.villageID = p.WardName
+                               AND v.stateID = p.stateID
+                               AND v.districtID = p.districtID
+                               AND v.townshipID = p.townshipID
+                               AND v.QVID = p.QVID
             WHERE p.userId = %s
         """
         params = [user_id]
