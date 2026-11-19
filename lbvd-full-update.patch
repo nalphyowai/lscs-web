@@ -1,0 +1,3644 @@
+diff --git a/app/lookups.py b/app/lookups.py
+index 219cc52..e288925 100644
+--- a/app/lookups.py
++++ b/app/lookups.py
+@@ -161,6 +161,46 @@ def _get_all_livestock_animals():
+         return []
+ 
+ 
++def _get_all_livestock_ages():
++    """Return agetype rows linked to a livestock (lsID...) animal.
++
++    Older databases contain a few rows where the animalTypeID / animalID
++    values were inserted in the wrong order, so both columns are checked.
++    """
++    try:
++        conn = get_db_connection(); cur = conn.cursor(dictionary=True)
++        try:
++            cur.execute(
++                "SELECT ageID, ageName, animalTypeID, animalID FROM agetype "
++                "ORDER BY ageID"
++            )
++            rows = []
++            seen = set()
++            for record in cur.fetchall():
++                animal_id = str(record.get("animalID") or "").strip()
++                if not animal_id.startswith("lsID"):
++                    candidate = str(record.get("animalTypeID") or "").strip()
++                    animal_id = candidate if candidate.startswith("lsID") else ""
++                if not animal_id:
++                    continue
++                age_id = str(record.get("ageID") or "").strip()
++                key = (animal_id, age_id)
++                if key in seen:
++                    continue
++                seen.add(key)
++                rows.append({
++                    "ageID": age_id,
++                    "ageName": str(record.get("ageName") or "").strip(),
++                    "animalID": animal_id,
++                })
++            return rows
++        finally:
++            cur.close(); conn.close()
++    except SQLAlchemyError as e:
++        logger.warning(f"_get_all_livestock_ages: {e}")
++        return []
++
++
+ def _get_all_breeding_animals():
+     try:
+         conn = get_db_connection(); cur = conn.cursor(dictionary=True)
+diff --git a/app/main.py b/app/main.py
+index dbd9ef5..1110e53 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -107,6 +107,7 @@ def ensure_personcv_record_uuid():
+ 
+ 
+ def ensure_village_table():
++    """Create the village table and add the Ward/Vg + code columns if missing."""
+     try:
+         with engine.begin() as conn:
+             conn.exec_driver_sql("""
+@@ -117,10 +118,29 @@ def ensure_village_table():
+                     QVID VARCHAR(30) NOT NULL,
+                     villageID VARCHAR(30) NOT NULL,
+                     villageName TEXT DEFAULT NULL,
++                    villageCode VARCHAR(50) DEFAULT NULL,
++                    wardOrVg VARCHAR(20) DEFAULT NULL,
+                     PRIMARY KEY (stateID, districtID, townshipID, QVID, villageID),
+                     KEY villageindex (stateID, districtID, townshipID, QVID, villageID)
+                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+             """)
++            existing = {column["name"] for column in inspect(conn).get_columns("village")}
++            if "villageCode" not in existing:
++                conn.exec_driver_sql(
++                    "ALTER TABLE village ADD COLUMN villageCode VARCHAR(50) DEFAULT NULL"
++                )
++                logger.info("village: added villageCode column")
++            if "wardOrVg" not in existing:
++                conn.exec_driver_sql(
++                    "ALTER TABLE village ADD COLUMN wardOrVg VARCHAR(20) DEFAULT NULL"
++                )
++                logger.info("village: added wardOrVg column")
++            # Older records predate the Ward/Vg field.  Treat them as village
++            # tracts so every row has a value and the UI can offer a default.
++            conn.exec_driver_sql(
++                "UPDATE village SET wardOrVg = 'Vg' "
++                "WHERE wardOrVg IS NULL OR TRIM(wardOrVg) = ''"
++            )
+         logger.info("village table ready")
+     except SQLAlchemyError as e:
+         logger.warning("ensure_village_table: %s", e)
+diff --git a/app/routers/survey.py b/app/routers/survey.py
+index 31d9d4b..f5c8ffa 100644
+--- a/app/routers/survey.py
++++ b/app/routers/survey.py
+@@ -22,6 +22,7 @@ from app.lookups import (
+     _get_all_breeding_animals,
+     _get_all_large_animals,
+     _get_all_livestock_animals,
++    _get_all_livestock_ages,
+     _get_all_small_animals,
+     _get_all_states,
+ )
+@@ -441,6 +442,7 @@ async def compat_process_step_3(form_id: str, request: Request):
+     return templates.TemplateResponse(request=request, name="FormPart3.html", context={
+         "active_page": "survey",
+         "livestockAni": _get_all_livestock_animals(),
++        "livestockAges": _get_all_livestock_ages(),
+         "form_id": form_id,
+         "states": _get_all_states(),
+         "user": request.session.get("user"),
+diff --git a/app/routers/villages.py b/app/routers/villages.py
+index 01c3763..454b2b6 100644
+--- a/app/routers/villages.py
++++ b/app/routers/villages.py
+@@ -24,6 +24,8 @@ logger = logging.getLogger("lbvd")
+ router = APIRouter(tags=["villages"])
+ 
+ VILLAGE_NAME_MAX = 150
++VILLAGE_CODE_MAX = 50
++WARD_OR_VG_MAX = 20
+ VILLAGE_ID_MAX_RETRIES = 5
+ VILLAGE_PAGE_SIZE = 10
+ 
+@@ -108,6 +110,56 @@ def _normalize_village_name(raw: str) -> str:
+     return re.sub(r"\s+", " ", name)
+ 
+ 
++def _cell_text(value) -> str:
++    """Excel cells may arrive as numbers (e.g. Pcode 219161) or text."""
++    if value is None:
++        return ""
++    if isinstance(value, float) and value.is_integer():
++        return str(int(value))
++    return unicodedata.normalize("NFC", str(value)).strip()
++
++
++def _normalize_header(value) -> str:
++    """Case/space tolerant header key: 'Ward/Village_ Pcode' -> 'ward/village_pcode'."""
++    text = unicodedata.normalize("NFKC", _cell_text(value)).lower()
++    text = re.sub(r"\s+", " ", text)
++    return re.sub(r"\s*([_/])\s*", r"\1", text)
++
++
++# Ward / village-tract classification used by both the manual forms and the
++# Excel importer.  Stored values are always one of these two canonical labels.
++WARD_OPTIONS = ("Ward", "Vg")
++_WARD_ALIASES = {
++    "ward": "Ward",
++    "wards": "Ward",
++    "ရပ်ကွက်": "Ward",
++    "vg": "Vg",
++    "village": "Vg",
++    "villages": "Vg",
++    "ကျေးရွာ": "Vg",
++}
++
++
++def _normalize_ward_or_vg(raw) -> str:
++    """Return 'Ward' or 'Vg'; an empty string means an invalid value."""
++    text = unicodedata.normalize("NFC", _cell_text(raw))
++    return _WARD_ALIASES.get(text.lower(), "")
++
++
++def _normalize_village_code(raw) -> str:
++    """Codes are optional, but are normalised when supplied."""
++    return _cell_text(raw)
++
++
++def _validate_village_code(code: str) -> str:
++    code = _normalize_village_code(code)
++    if len(code) > VILLAGE_CODE_MAX:
++        raise HTTPException(
++            400, f"ကျေးရွာကုဒ်သည် {VILLAGE_CODE_MAX} လုံးထက် မကျော်ရပါ။"
++        )
++    return code
++
++
+ def _fetch_qvs(cursor, state_id: str, district_id: str, township_id: str) -> list[dict]:
+     cursor.execute(
+         "SELECT QVID, QVName FROM qv "
+@@ -146,11 +198,30 @@ def _find_duplicate_village(cursor, state_id: str, district_id: str,
+     return cursor.fetchone()
+ 
+ 
++def _find_duplicate_village_code(cursor, state_id: str, district_id: str,
++                                 township_id: str, qv_id: str, code: str,
++                                 exclude_village_id: str | None = None):
++    """Return a village with the same Pcode inside the same QV."""
++    sql = (
++        "SELECT villageID FROM village "
++        "WHERE stateID = %s AND districtID = %s AND townshipID = %s AND QVID = %s "
++        "AND villageCode = %s"
++    )
++    params = [state_id, district_id, township_id, qv_id, code]
++    if exclude_village_id:
++        sql += " AND villageID <> %s"
++        params.append(exclude_village_id)
++    sql += " LIMIT 1"
++    cursor.execute(sql, tuple(params))
++    return cursor.fetchone()
++
++
+ def _fetch_villages(cursor, state_id: str, district_id: str, township_id: str,
+                     qv_id: str = "", limit: int | None = None,
+                     offset: int = 0) -> list[dict]:
+     sql = """
+         SELECT v.QVID, v.villageID, v.villageName, v.districtID, v.townshipID,
++               v.villageCode, v.wardOrVg,
+                COALESCE(q.QVName, v.QVID) AS QVName
+         FROM village v
+         LEFT JOIN qv q
+@@ -578,12 +649,16 @@ async def api_create_township_village(
+     request: Request,
+     qv: str = Form(...),
+     villageName: str = Form(...),
++    wardOrVg: str = Form(""),
++    villageCode: str = Form(""),
+ ):
+     user = get_signed_in_user(request)
+     state_id, district_id, township_id = _township_scope(user)
+ 
+     qv_id = (qv or "").strip()
+     name = _normalize_village_name(villageName)
++    ward = _normalize_ward_or_vg(wardOrVg)
++    code = _validate_village_code(villageCode)
+ 
+     if not qv_id:
+         raise HTTPException(400, "ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။")
+@@ -591,6 +666,8 @@ async def api_create_township_village(
+         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
+     if len(name) > VILLAGE_NAME_MAX:
+         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
++    if not ward:
++        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
+ 
+     conn = cursor = None
+     try:
+@@ -611,6 +688,13 @@ async def api_create_township_village(
+                 409,
+                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
+             )
++        if code and _find_duplicate_village_code(
++            cursor, state_id, district_id, township_id, qv_id, code,
++        ):
++            raise HTTPException(
++                409,
++                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
++            )
+ 
+         created_id = None
+         for attempt in range(VILLAGE_ID_MAX_RETRIES):
+@@ -620,9 +704,13 @@ async def api_create_township_village(
+                 )
+                 cursor.execute(
+                     "INSERT INTO village "
+-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
+-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+-                    (state_id, district_id, township_id, qv_id, village_id, name),
++                    "(stateID, districtID, townshipID, QVID, villageID, "
++                    "villageName, villageCode, wardOrVg) "
++                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
++                    (
++                        state_id, district_id, township_id, qv_id, village_id,
++                        name, code or None, ward,
++                    ),
+                 )
+                 conn.commit()
+                 created_id = village_id
+@@ -653,6 +741,8 @@ async def api_create_township_village(
+                 "QVName": qv_name,
+                 "villageID": created_id,
+                 "villageName": name,
++                "villageCode": code,
++                "wardOrVg": ward,
+             },
+         }
+     except HTTPException:
+@@ -679,6 +769,8 @@ async def api_update_township_village(
+     village_id: str,
+     qv: str = Form(...),
+     villageName: str = Form(...),
++    wardOrVg: str = Form(""),
++    villageCode: str = Form(""),
+ ):
+     user = get_signed_in_user(request)
+     state_id, district_id, township_id = _township_scope(user)
+@@ -687,6 +779,8 @@ async def api_update_township_village(
+     old_village_id = (village_id or "").strip()
+     new_qv_id = (qv or "").strip()
+     name = _normalize_village_name(villageName)
++    ward = _normalize_ward_or_vg(wardOrVg)
++    code = _validate_village_code(villageCode)
+ 
+     if not new_qv_id:
+         raise HTTPException(400, "ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။")
+@@ -694,6 +788,8 @@ async def api_update_township_village(
+         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
+     if len(name) > VILLAGE_NAME_MAX:
+         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
++    if not ward:
++        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
+ 
+     conn = cursor = None
+     try:
+@@ -724,6 +820,14 @@ async def api_update_township_village(
+                 409,
+                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
+             )
++        if code and _find_duplicate_village_code(
++            cursor, state_id, district_id, township_id, new_qv_id, code,
++            exclude_village_id=old_village_id,
++        ):
++            raise HTTPException(
++                409,
++                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
++            )
+ 
+         updated_id = old_village_id
+         if moving_qv:
+@@ -733,11 +837,12 @@ async def api_update_township_village(
+                         cursor, state_id, district_id, township_id, new_qv_id,
+                     )
+                     cursor.execute(
+-                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s "
++                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s, "
++                        "villageCode = %s, wardOrVg = %s "
+                         "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
+                         "AND QVID = %s AND villageID = %s",
+                         (
+-                            new_qv_id, updated_id, name,
++                            new_qv_id, updated_id, name, code or None, ward,
+                             state_id, district_id, township_id,
+                             old_qv_id, old_village_id,
+                         ),
+@@ -758,11 +863,11 @@ async def api_update_township_village(
+                         )
+         else:
+             cursor.execute(
+-                "UPDATE village SET villageName = %s "
++                "UPDATE village SET villageName = %s, villageCode = %s, wardOrVg = %s "
+                 "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
+                 "AND QVID = %s AND villageID = %s",
+                 (
+-                    name,
++                    name, code or None, ward,
+                     state_id, district_id, township_id,
+                     old_qv_id, old_village_id,
+                 ),
+@@ -783,6 +888,8 @@ async def api_update_township_village(
+                 "QVName": qv_name,
+                 "villageID": updated_id,
+                 "villageName": name,
++                "villageCode": code,
++                "wardOrVg": ward,
+             },
+         }
+     except HTTPException:
+@@ -947,6 +1054,8 @@ async def api_create_temporary_village(
+     township: str = Form(...),
+     qv: str = Form(...),
+     villageName: str = Form(...),
++    wardOrVg: str = Form(""),
++    villageCode: str = Form(""),
+ ):
+     user = get_signed_in_user(request)
+     state_id = _township_state(user)
+@@ -955,6 +1064,8 @@ async def api_create_temporary_village(
+     township_id = (township or "").strip()
+     qv_id = (qv or "").strip()
+     name = _normalize_village_name(villageName)
++    ward = _normalize_ward_or_vg(wardOrVg)
++    code = _validate_village_code(villageCode)
+ 
+     if not district_id:
+         raise HTTPException(400, "ခရိုင် တစ်ခု ရွေးချယ်ပါ။")
+@@ -966,6 +1077,8 @@ async def api_create_temporary_village(
+         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
+     if len(name) > VILLAGE_NAME_MAX:
+         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
++    if not ward:
++        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
+ 
+     conn = cursor = None
+     try:
+@@ -986,6 +1099,13 @@ async def api_create_temporary_village(
+                 409,
+                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
+             )
++        if code and _find_duplicate_village_code(
++            cursor, state_id, district_id, township_id, qv_id, code,
++        ):
++            raise HTTPException(
++                409,
++                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
++            )
+ 
+         created_id = None
+         for attempt in range(VILLAGE_ID_MAX_RETRIES):
+@@ -995,9 +1115,13 @@ async def api_create_temporary_village(
+                 )
+                 cursor.execute(
+                     "INSERT INTO village "
+-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
+-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+-                    (state_id, district_id, township_id, qv_id, village_id, name),
++                    "(stateID, districtID, townshipID, QVID, villageID, "
++                    "villageName, villageCode, wardOrVg) "
++                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
++                    (
++                        state_id, district_id, township_id, qv_id, village_id,
++                        name, code or None, ward,
++                    ),
+                 )
+                 conn.commit()
+                 created_id = village_id
+@@ -1033,6 +1157,8 @@ async def api_create_temporary_village(
+                 "QVName": qv_name,
+                 "villageID": created_id,
+                 "villageName": name,
++                "villageCode": code,
++                "wardOrVg": ward,
+             },
+         }
+     except HTTPException:
+@@ -1063,6 +1189,8 @@ async def api_update_temporary_village(
+     village_id: str,
+     qv: str = Form(...),
+     villageName: str = Form(...),
++    wardOrVg: str = Form(""),
++    villageCode: str = Form(""),
+ ):
+     user = get_signed_in_user(request)
+     state_id = _township_state(user)
+@@ -1073,6 +1201,8 @@ async def api_update_temporary_village(
+     old_village_id = (village_id or "").strip()
+     new_qv_id = (qv or "").strip()
+     name = _normalize_village_name(villageName)
++    ward = _normalize_ward_or_vg(wardOrVg)
++    code = _validate_village_code(villageCode)
+ 
+     if not district_id or not township_id:
+         raise HTTPException(400, "ခရိုင် နှင့် မြို့နယ် အချက်အလက် မပြည့်စုံပါ။")
+@@ -1082,6 +1212,8 @@ async def api_update_temporary_village(
+         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
+     if len(name) > VILLAGE_NAME_MAX:
+         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
++    if not ward:
++        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
+ 
+     conn = cursor = None
+     try:
+@@ -1115,6 +1247,14 @@ async def api_update_temporary_village(
+                 409,
+                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
+             )
++        if code and _find_duplicate_village_code(
++            cursor, state_id, district_id, township_id, new_qv_id, code,
++            exclude_village_id=old_village_id,
++        ):
++            raise HTTPException(
++                409,
++                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
++            )
+ 
+         updated_id = old_village_id
+         if moving_qv:
+@@ -1124,11 +1264,12 @@ async def api_update_temporary_village(
+                         cursor, state_id, district_id, township_id, new_qv_id,
+                     )
+                     cursor.execute(
+-                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s "
++                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s, "
++                        "villageCode = %s, wardOrVg = %s "
+                         "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
+                         "AND QVID = %s AND villageID = %s",
+                         (
+-                            new_qv_id, updated_id, name,
++                            new_qv_id, updated_id, name, code or None, ward,
+                             state_id, district_id, township_id,
+                             old_qv_id, old_village_id,
+                         ),
+@@ -1149,11 +1290,11 @@ async def api_update_temporary_village(
+                         )
+         else:
+             cursor.execute(
+-                "UPDATE village SET villageName = %s "
++                "UPDATE village SET villageName = %s, villageCode = %s, wardOrVg = %s "
+                 "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
+                 "AND QVID = %s AND villageID = %s",
+                 (
+-                    name,
++                    name, code or None, ward,
+                     state_id, district_id, township_id,
+                     old_qv_id, old_village_id,
+                 ),
+@@ -1176,6 +1317,8 @@ async def api_update_temporary_village(
+                 "QVName": qv_name,
+                 "villageID": updated_id,
+                 "villageName": name,
++                "villageCode": code,
++                "wardOrVg": ward,
+             },
+         }
+     except HTTPException:
+@@ -1274,24 +1417,190 @@ async def api_delete_temporary_village(
+ IMPORT_SHEET_TITLE = "Villages"
+ IMPORT_HEADER_NAME = "villageName"
+ IMPORT_HEADER_NO = "No."
++IMPORT_HEADER_WARD = "Ward and Vg"
++IMPORT_HEADER_CODE = "Ward/Village_ Pcode"
+ IMPORT_HEADER_NO_ALIASES = {"no.", "no"}
++IMPORT_HEADER_WARD_ALIASES = {
++    _normalize_header(IMPORT_HEADER_WARD),
++    "ward and village",
++    "ward",
++}
++IMPORT_HEADER_CODE_ALIASES = {
++    _normalize_header(IMPORT_HEADER_CODE),
++    "ward/village pcode",
++    "villagepcode",
++    "villagecode",
++    "pcode",
++}
++
++
++def _parse_import_headers(headers: list[str]) -> tuple[int, int | None, int | None]:
++    """Validate the header row and locate the name/ward/code columns.
++
++    `villageName` is always required.  `Ward and Vg` is required for any new
++    layout, while `Ward/Village_ Pcode` may be omitted entirely.  `No.` is
++    optional and only represents a serial number; villageID is generated.
++
++    Accepted layouts (columns in any order):
++      - villageName                                  (legacy, ward defaults to Vg)
++      - No., villageName                             (legacy, ward defaults to Vg)
++      - Ward and Vg, villageName
++      - No., Ward and Vg, villageName
++      - Ward and Vg, Ward/Village_ Pcode, villageName
++      - No., Ward and Vg, Ward/Village_ Pcode, villageName
++    """
++    if not headers:
++        raise HTTPException(400, "Excel ဖိုင်၏ ပထမတန်းတွင် ကော်လံခေါင်းစဉ် မပါဝင်ပါ။")
++    if len(headers) > 4:
++        raise HTTPException(
++            400,
++            "Excel ဖိုင်တွင် ကော်လံ လေးခုထက် မပိုရပါ။ "
++            "(No., Ward and Vg, Ward/Village_ Pcode, villageName)",
++        )
++
++    keys = [_normalize_header(header) for header in headers]
++    name_key = _normalize_header(IMPORT_HEADER_NAME)
++    if keys.count(name_key) != 1:
++        raise HTTPException(
++            400,
++            "'villageName' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
++        )
++    name_idx = keys.index(name_key)
++
++    def matches(aliases: set[str]) -> list[int]:
++        return [i for i, key in enumerate(keys) if key in aliases]
++
++    ward_matches = matches(IMPORT_HEADER_WARD_ALIASES)
++    code_matches = matches(IMPORT_HEADER_CODE_ALIASES)
++    no_matches = matches(IMPORT_HEADER_NO_ALIASES)
++    duplicate_message = "ကော်လံခေါင်းစဉ်များ ထပ်နေပါသည်။"
++    if len(ward_matches) > 1 or len(code_matches) > 1 or len(no_matches) > 1:
++        raise HTTPException(400, duplicate_message)
++
++    ward_idx = ward_matches[0] if ward_matches else None
++    code_idx = code_matches[0] if code_matches else None
++    known = {name_idx}
++    for idx in (ward_idx, code_idx, *(no_matches or [])):
++        if idx is None:
++            continue
++        if idx in known:
++            raise HTTPException(400, duplicate_message)
++        known.add(idx)
++
++    if len(known) != len(headers):
++        raise HTTPException(
++            400,
++            "မမှန်ကန်သော ကော်လံခေါင်းစဉ် ပါဝင်ပါသည်။ "
++            "(No., Ward and Vg, Ward/Village_ Pcode, villageName)",
++        )
++
++    # The only legacy layouts without a Ward column are the original one- and
++    # two-column files.  Every other file must state Ward explicitly.
++    if ward_idx is None and len(headers) > 2:
++        raise HTTPException(
++            400,
++            "'Ward and Vg' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
++        )
++    if len(headers) == 2 and ward_idx is None and not no_matches:
++        raise HTTPException(
++            400,
++            "ကော်လံ နှစ်ခုရှိပါက 'No.' နှင့် 'villageName' သို့မဟုတ် "
++            "'Ward and Vg' နှင့် 'villageName' ပါဝင်ရပါမည်။",
++        )
++    if len(headers) == 4 and (code_idx is None or not no_matches):
++        raise HTTPException(
++            400,
++            "ကော်လံ လေးခုရှိပါက 'No.', 'Ward and Vg', "
++            "'Ward/Village_ Pcode', 'villageName' တို့ ပါဝင်ရပါမည်။",
++        )
++
++    return name_idx, ward_idx, code_idx
++
++
++def _parse_import_record(row: list, name_idx: int, ward_idx: int | None,
++                         code_idx: int | None, row_number: int):
++    """Return (record, None) or (None, skip-details) for one Excel row."""
++    def cell(index: int | None) -> str:
++        return _cell_text(row[index]) if index is not None and index < len(row) else ""
++
++    raw_name = cell(name_idx)
++    if not raw_name:
++        return None, {
++            "row": row_number,
++            "villageName": "",
++            "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
++        }
++
++    name = _normalize_village_name(raw_name)
++    if not name:
++        return None, {
++            "row": row_number,
++            "villageName": raw_name,
++            "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
++        }
++    if len(name) > VILLAGE_NAME_MAX:
++        return None, {
++            "row": row_number,
++            "villageName": name,
++            "reason": f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။",
++        }
++
++    raw_ward = cell(ward_idx)
++    ward = _normalize_ward_or_vg(raw_ward)
++    if ward_idx is not None and not ward:
++        reason = (
++            "'Ward and Vg' ကော်လံ ဗလာဖြစ်နေပါသည်။"
++            if not raw_ward
++            else "'Ward and Vg' ကော်လံတွင် 'Ward' သို့မဟုတ် 'Vg' ထည့်ပါ။"
++        )
++        return None, {
++            "row": row_number,
++            "villageName": name,
++            "reason": reason,
++        }
++    if len(raw_ward) > WARD_OR_VG_MAX:
++        return None, {
++            "row": row_number,
++            "villageName": name,
++            "reason": f"'Ward and Vg' သည် {WARD_OR_VG_MAX} လုံးထက် မကျော်ရပါ။",
++        }
++    # Legacy one/two-column workbooks have no ward column; tag those rows as
++    # village tracts so every stored record still has a Ward/Vg value.
++    if not ward:
++        ward = "Vg"
++
++    code = _normalize_village_code(cell(code_idx))
++    if len(code) > VILLAGE_CODE_MAX:
++        return None, {
++            "row": row_number,
++            "villageName": name,
++            "reason": f"'Ward/Village_ Pcode' သည် {VILLAGE_CODE_MAX} လုံးထက် မကျော်ရပါ။",
++        }
++
++    return {"name": name, "ward": ward, "code": code}, None
+ 
+ 
+ @router.get("/api/township/villages/sample-excel")
+ async def api_download_sample_village_excel(request: Request):
+-    """Download the two-column Excel template used by the importer."""
++    """Download the Excel template used by the importer."""
+     user = get_signed_in_user(request)
+     _township_scope(user)
+ 
+     wb = Workbook()
+     ws = wb.active
+     ws.title = IMPORT_SHEET_TITLE
+-    ws.append([IMPORT_HEADER_NO, IMPORT_HEADER_NAME])
+-    ws.append([1, "ကန်ရိုးကျေးရွာ"])
+-    ws.append([2, "ဆံပင်ကျေးရွာ"])
+-    ws.append([3, "မြို့လယ်ကျေးရွာ"])
++    ws.append([
++        IMPORT_HEADER_NO, IMPORT_HEADER_WARD, IMPORT_HEADER_CODE,
++        IMPORT_HEADER_NAME,
++    ])
++    ws.append([1, "Vg", 219161, "ဆိတ်နံကုန်း"])
++    ws.append([2, "Ward", 219162, "ကန်ရိုးကျေးရွာ"])
++    # The last row shows that an unknown Pcode may be left blank.
++    ws.append([3, "Vg", None, "မြို့လယ်ကျေးရွာ"])
+     ws.column_dimensions["A"].width = 8
+-    ws.column_dimensions["B"].width = 32
++    ws.column_dimensions["B"].width = 16
++    ws.column_dimensions["C"].width = 24
++    ws.column_dimensions["D"].width = 32
+ 
+     output = BytesIO()
+     wb.save(output)
+@@ -1308,11 +1617,11 @@ async def api_download_sample_village_excel(request: Request):
+ 
+ @router.post("/api/township/villages/import-excel")
+ async def api_import_township_villages_excel(request: Request):
+-    """Import villages from a one-sheet, at-most-two-column Excel file.
++    """Import villages from a one-sheet Excel file.
+ 
+     Every inserted row reuses the account's state/district/township and the
+-    QV chosen in the upload form.  Rows whose village name is blank, too long
+-    or already present inside the same QV are skipped and reported back.
++    QV chosen in the upload form.  Ward/Vg is required and the village code is
++    optional.  Invalid or duplicate rows are skipped and reported back.
+     """
+     user = get_signed_in_user(request)
+     state_id, district_id, township_id = _township_scope(user)
+@@ -1367,28 +1676,7 @@ async def api_import_township_villages_excel(request: Request):
+         while headers and headers[-1] == "":
+             headers.pop()
+ 
+-        if not headers:
+-            raise HTTPException(400, "Excel ဖိုင်၏ ပထမတန်းတွင် ကော်လံခေါင်းစဉ် မပါဝင်ပါ။")
+-        if len(headers) > 2:
+-            raise HTTPException(
+-                400,
+-                "Excel ဖိုင်တွင် ကော်လံ နှစ်ခုထက် မပိုရပါ။ (No. နှင့် villageName)",
+-            )
+-        if headers.count(IMPORT_HEADER_NAME) != 1:
+-            raise HTTPException(
+-                400,
+-                "'villageName' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
+-            )
+-
+-        name_idx = headers.index(IMPORT_HEADER_NAME)
+-        if len(headers) == 2:
+-            first_header = headers[0].strip().lower()
+-            if name_idx != 1 or first_header not in IMPORT_HEADER_NO_ALIASES:
+-                raise HTTPException(
+-                    400,
+-                    "ကော်လံ နှစ်ခုရှိပါက ပထမကော်လံမှာ 'No.' နှင့် "
+-                    "ဒုတိယကော်လံမှာ 'villageName' ဖြစ်ရပါမည်။",
+-                )
++        name_idx, ward_idx, code_idx = _parse_import_headers(headers)
+ 
+         conn = cursor = None
+         try:
+@@ -1408,41 +1696,33 @@ async def api_import_township_villages_excel(request: Request):
+                 ):
+                     continue
+ 
+-                raw_name = row[name_idx] if name_idx < len(row) else None
+-                if raw_name is None or str(raw_name).strip() == "":
+-                    skipped.append({
+-                        "row": row_number,
+-                        "villageName": "",
+-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
+-                    })
++                record, skip = _parse_import_record(
++                    row, name_idx, ward_idx, code_idx, row_number,
++                )
++                if skip is not None:
++                    skipped.append(skip)
+                     continue
+ 
+-                name = _normalize_village_name(str(raw_name))
+-                if not name:
+-                    skipped.append({
+-                        "row": row_number,
+-                        "villageName": str(raw_name),
+-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
+-                    })
+-                    continue
+-                if len(name) > VILLAGE_NAME_MAX:
++                name = record["name"]
++                ward = record["ward"]
++                code = record["code"]
++
++                if _find_duplicate_village(
++                    cursor, state_id, district_id, township_id, qv_id, name,
++                ):
+                     skipped.append({
+                         "row": row_number,
+                         "villageName": name,
+-                        "reason": (
+-                            f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် "
+-                            "မကျော်ရပါ။"
+-                        ),
++                        "reason": "ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
+                     })
+                     continue
+-
+-                if _find_duplicate_village(
+-                    cursor, state_id, district_id, township_id, qv_id, name,
++                if code and _find_duplicate_village_code(
++                    cursor, state_id, district_id, township_id, qv_id, code,
+                 ):
+                     skipped.append({
+                         "row": row_number,
+                         "villageName": name,
+-                        "reason": "ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
++                        "reason": "ဒီ Ward/Village_ Pcode သည် ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+                     })
+                     continue
+ 
+@@ -1451,9 +1731,13 @@ async def api_import_township_villages_excel(request: Request):
+                 )
+                 cursor.execute(
+                     "INSERT INTO village "
+-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
+-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+-                    (state_id, district_id, township_id, qv_id, village_id, name),
++                    "(stateID, districtID, townshipID, QVID, villageID, "
++                    "villageName, villageCode, wardOrVg) "
++                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
++                    (
++                        state_id, district_id, township_id, qv_id, village_id,
++                        name, code or None, ward or None,
++                    ),
+                 )
+                 inserted += 1
+ 
+@@ -1505,19 +1789,25 @@ async def api_import_township_villages_excel(request: Request):
+ # ============================================================
+ @router.get("/api/township/temporary-villages/sample-excel")
+ async def api_download_temporary_sample_village_excel(request: Request):
+-    """Download the same two-column template used by the temporary page."""
++    """Download the same Excel template used by the temporary page."""
+     user = get_signed_in_user(request)
+     _township_state(user)
+ 
+     wb = Workbook()
+     ws = wb.active
+     ws.title = IMPORT_SHEET_TITLE
+-    ws.append([IMPORT_HEADER_NO, IMPORT_HEADER_NAME])
+-    ws.append([1, "ကန်ရိုးကျေးရွာ"])
+-    ws.append([2, "ဆံပင်ကျေးရွာ"])
+-    ws.append([3, "မြို့လယ်ကျေးရွာ"])
++    ws.append([
++        IMPORT_HEADER_NO, IMPORT_HEADER_WARD, IMPORT_HEADER_CODE,
++        IMPORT_HEADER_NAME,
++    ])
++    ws.append([1, "Vg", 219161, "ဆိတ်နံကုန်း"])
++    ws.append([2, "Ward", 219162, "ကန်ရိုးကျေးရွာ"])
++    # The last row shows that an unknown Pcode may be left blank.
++    ws.append([3, "Vg", None, "မြို့လယ်ကျေးရွာ"])
+     ws.column_dimensions["A"].width = 8
+-    ws.column_dimensions["B"].width = 32
++    ws.column_dimensions["B"].width = 16
++    ws.column_dimensions["C"].width = 24
++    ws.column_dimensions["D"].width = 32
+ 
+     output = BytesIO()
+     wb.save(output)
+@@ -1593,28 +1883,7 @@ async def api_import_temporary_villages_excel(request: Request):
+         while headers and headers[-1] == "":
+             headers.pop()
+ 
+-        if not headers:
+-            raise HTTPException(400, "Excel ဖိုင်၏ ပထမတန်းတွင် ကော်လံခေါင်းစဉ် မပါဝင်ပါ။")
+-        if len(headers) > 2:
+-            raise HTTPException(
+-                400,
+-                "Excel ဖိုင်တွင် ကော်လံ နှစ်ခုထက် မပိုရပါ။ (No. နှင့် villageName)",
+-            )
+-        if headers.count(IMPORT_HEADER_NAME) != 1:
+-            raise HTTPException(
+-                400,
+-                "'villageName' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
+-            )
+-
+-        name_idx = headers.index(IMPORT_HEADER_NAME)
+-        if len(headers) == 2:
+-            first_header = headers[0].strip().lower()
+-            if name_idx != 1 or first_header not in IMPORT_HEADER_NO_ALIASES:
+-                raise HTTPException(
+-                    400,
+-                    "ကော်လံ နှစ်ခုရှိပါက ပထမကော်လံမှာ 'No.' နှင့် "
+-                    "ဒုတိယကော်လံမှာ 'villageName' ဖြစ်ရပါမည်။",
+-                )
++        name_idx, ward_idx, code_idx = _parse_import_headers(headers)
+ 
+         conn = cursor = None
+         try:
+@@ -1636,41 +1905,33 @@ async def api_import_temporary_villages_excel(request: Request):
+                 ):
+                     continue
+ 
+-                raw_name = row[name_idx] if name_idx < len(row) else None
+-                if raw_name is None or str(raw_name).strip() == "":
+-                    skipped.append({
+-                        "row": row_number,
+-                        "villageName": "",
+-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
+-                    })
++                record, skip = _parse_import_record(
++                    row, name_idx, ward_idx, code_idx, row_number,
++                )
++                if skip is not None:
++                    skipped.append(skip)
+                     continue
+ 
+-                name = _normalize_village_name(str(raw_name))
+-                if not name:
+-                    skipped.append({
+-                        "row": row_number,
+-                        "villageName": str(raw_name),
+-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
+-                    })
+-                    continue
+-                if len(name) > VILLAGE_NAME_MAX:
++                name = record["name"]
++                ward = record["ward"]
++                code = record["code"]
++
++                if _find_duplicate_village(
++                    cursor, state_id, district_id, township_id, qv_id, name,
++                ):
+                     skipped.append({
+                         "row": row_number,
+                         "villageName": name,
+-                        "reason": (
+-                            f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် "
+-                            "မကျော်ရပါ။"
+-                        ),
++                        "reason": "ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
+                     })
+                     continue
+-
+-                if _find_duplicate_village(
+-                    cursor, state_id, district_id, township_id, qv_id, name,
++                if code and _find_duplicate_village_code(
++                    cursor, state_id, district_id, township_id, qv_id, code,
+                 ):
+                     skipped.append({
+                         "row": row_number,
+                         "villageName": name,
+-                        "reason": "ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
++                        "reason": "ဒီ Ward/Village_ Pcode သည် ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+                     })
+                     continue
+ 
+@@ -1679,9 +1940,13 @@ async def api_import_temporary_villages_excel(request: Request):
+                 )
+                 cursor.execute(
+                     "INSERT INTO village "
+-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
+-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+-                    (state_id, district_id, township_id, qv_id, village_id, name),
++                    "(stateID, districtID, townshipID, QVID, villageID, "
++                    "villageName, villageCode, wardOrVg) "
++                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
++                    (
++                        state_id, district_id, township_id, qv_id, village_id,
++                        name, code or None, ward or None,
++                    ),
+                 )
+                 inserted += 1
+ 
+diff --git a/deploy/lbvd-schema.sql b/deploy/lbvd-schema.sql
+index f59ec95..520a5f1 100644
+--- a/deploy/lbvd-schema.sql
++++ b/deploy/lbvd-schema.sql
+@@ -177,6 +177,8 @@ CREATE TABLE `village` (
+   `QVID` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+   `villageID` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+   `villageName` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
++  `villageCode` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
++  `wardOrVg` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+   PRIMARY KEY (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`),
+   KEY `villageindex` (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`)
+ ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+diff --git a/deploy/seed.sql b/deploy/seed.sql
+index a935573..8dd2aec 100644
+--- a/deploy/seed.sql
++++ b/deploy/seed.sql
+@@ -177,6 +177,8 @@ CREATE TABLE `village` (
+   `QVID` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+   `villageID` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+   `villageName` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
++  `villageCode` varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
++  `wardOrVg` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+   PRIMARY KEY (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`),
+   KEY `villageindex` (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`)
+ ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+diff --git a/init-db.sql b/init-db.sql
+index 658c319..546daf5 100644
+--- a/init-db.sql
++++ b/init-db.sql
+@@ -19304,6 +19304,8 @@ CREATE TABLE IF NOT EXISTS `village` (
+   `QVID` varchar(30) NOT NULL,
+   `villageID` varchar(30) NOT NULL,
+   `villageName` text DEFAULT NULL,
++  `villageCode` varchar(50) DEFAULT NULL,
++  `wardOrVg` varchar(20) DEFAULT NULL,
+   PRIMARY KEY (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`),
+   KEY `villageindex` (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`)
+ ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+diff --git a/templates/FormPart1.html b/templates/FormPart1.html
+index 09e8603..063b882 100644
+--- a/templates/FormPart1.html
++++ b/templates/FormPart1.html
+@@ -125,8 +125,17 @@
+                         <input type="text" id="respondentAge" name="age" required inputmode="numeric" class="form-control" style="background:#fff;">
+                     </div>
+                     <div class="col-6">
+-                        <label class="form-label">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
+-                        <input type="text" id="respondentEducation" name="eduStatus" required class="form-control" style="background:#fff;">
++                        <label class="form-label" for="respondentEducation">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
++                        <select id="respondentEducation" name="eduStatus" required class="form-select" style="background:#fff;">
++                            <option value="" disabled selected>---- ရွေးချယ်ပါ -----</option>
++                            <option value="ဘက">ဘက</option>
++                            <option value="မူလတန်း">မူလတန်း</option>
++                            <option value="အလယ်တန်း">အလယ်တန်း</option>
++                            <option value="ဘွဲ့ကြို">ဘွဲ့ကြို</option>
++                            <option value="ဘွဲ့ရ">ဘွဲ့ရ</option>
++                            <option value="ဘွဲ့လွန်">ဘွဲ့လွန်</option>
++                            <option value="အခြား">အခြား</option>
++                        </select>
+                     </div>
+                 </div>
+                 <div>
+@@ -166,8 +175,17 @@
+                         <input type="text" id="headAge" name="headAge" required inputmode="numeric" class="form-control" style="background:#fff;">
+                     </div>
+                     <div class="col-6">
+-                        <label class="form-label">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
+-                        <input type="text" id="headEducation" name="headEduStatus" required class="form-control" style="background:#fff;">
++                        <label class="form-label" for="headEducation">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
++                        <select id="headEducation" name="headEduStatus" required class="form-select" style="background:#fff;">
++                            <option value="" disabled selected>---- ရွေးချယ်ပါ -----</option>
++                            <option value="ဘက">ဘက</option>
++                            <option value="မူလတန်း">မူလတန်း</option>
++                            <option value="အလယ်တန်း">အလယ်တန်း</option>
++                            <option value="ဘွဲ့ကြို">ဘွဲ့ကြို</option>
++                            <option value="ဘွဲ့ရ">ဘွဲ့ရ</option>
++                            <option value="ဘွဲ့လွန်">ဘွဲ့လွန်</option>
++                            <option value="အခြား">အခြား</option>
++                        </select>
+                     </div>
+                 </div>
+                 <div>
+@@ -294,6 +312,10 @@
+     }
+ 
+     #collectionDetails input[readonly] { background: #f0fdf4 !important; border-color: #b9dfca; color: #23533b; }
++    #collectionDetails select.locked-education {
++        background: #f0fdf4 !important; border-color: #b9dfca; color: #23533b;
++        pointer-events: none; opacity: 1;
++    }
+     @media (max-width: 575.98px) {
+         .household-match { padding: 18px; }
+         .household-match-options { grid-template-columns: 1fr; gap: 10px; }
+@@ -584,7 +606,16 @@ function setupRespondentHeadSync(form) {
+         }
+         pairs.forEach(([respondent, head]) => {
+             const target = field(head);
+-            target.readOnly = same;
++            if (!target) return;
++            if (target.tagName === 'SELECT') {
++                // A select cannot be readOnly. Keep it enabled so its value is
++                // still submitted, but lock the control visually and via focus.
++                target.classList.toggle('locked-education', same);
++                target.setAttribute('aria-disabled', String(same));
++                target.tabIndex = same ? -1 : 0;
++            } else {
++                target.readOnly = same;
++            }
+             if (same) {
+                 target.value = field(respondent).value;
+                 target.classList.remove('error-input');
+@@ -600,12 +631,19 @@ function setupRespondentHeadSync(form) {
+         wasSame = same;
+     }
+     form.querySelectorAll('[name="respondent_is_head"]').forEach(radio => radio.addEventListener('change', sync));
+-    pairs.forEach(([respondent]) => field(respondent).addEventListener('input', () => {
+-        if (respondent === 'age') {
+-            field(respondent).value = stripNonDigits(field(respondent).value);
++    pairs.forEach(([respondent]) => {
++        const source = field(respondent);
++        if (!source) return;
++        const handleSourceChange = () => {
++            if (respondent === 'age') source.value = stripNonDigits(source.value);
++            if (isSame()) sync();
++        };
++        if (source.tagName === 'SELECT') {
++            source.addEventListener('change', handleSourceChange);
++        } else {
++            source.addEventListener('input', handleSourceChange);
+         }
+-        if (isSame()) sync();
+-    }));
++    });
+     form.querySelectorAll('[name="gender"]').forEach(radio => radio.addEventListener('change', sync));
+     headRadios.forEach(radio => {
+         radio.addEventListener('click', event => { if (isSame()) event.preventDefault(); });
+@@ -823,10 +861,10 @@ document.addEventListener('DOMContentLoaded', async function () {
+         const collecting = isCollecting();
+         const details = document.getElementById('collectionDetails');
+         details.classList.toggle('d-none', !collecting);
+-        details.querySelectorAll('input').forEach(input => {
+-            input.disabled = !collecting;
+-            input.required = collecting;
+-            input.classList.remove('error-input');
++        details.querySelectorAll('input, select').forEach(field => {
++            field.disabled = !collecting;
++            field.required = collecting;
++            field.classList.remove('error-input');
+         });
+         if (nextBtn) nextBtn.innerHTML = collecting
+             ? 'နောက်စာမျက်နှာသို့ <i class="bi bi-arrow-right"></i>'
+diff --git a/templates/FormPart3.html b/templates/FormPart3.html
+index 68141bf..2011c8b 100644
+--- a/templates/FormPart3.html
++++ b/templates/FormPart3.html
+@@ -48,9 +48,38 @@
+                 </div>
+             </div>
+             <div class="table-responsive custom-scrollbar">
++                <style>
++                    .poultry-desc-row td {
++                        background: #f0fdf4;
++                        border-color: #b9dfca !important;
++                        color: #23533b;
++                        font-size: .75rem;
++                        vertical-align: top;
++                        padding: .4rem .5rem;
++                    }
++                    .poultry-age-desc-label { font-weight: 700; margin-right: .35rem; }
++                    .poultry-age-desc-cell { line-height: 1.5; }
++                    .poultry-age-desc-value { white-space: nowrap; }
++                    .poultry-age-desc-empty { color: #6b7280; font-style: italic; }
++                </style>
+                 <script>
+                     const livestockAnimalData = {{ livestockAni | tojson | safe }};
++                    const livestockAgeData = {{ livestockAges | default([]) | tojson | safe }};
+                     const animalOptions = livestockAnimalData.map(la => `<option value="${la.animalID}">${la.animalName}</option>`).join('');
++
++                    const livestockAgesByAnimal = {};
++                    livestockAgeData.forEach(item => {
++                        const animalID = String(item.animalID || '').trim();
++                        if (!animalID) return;
++                        if (!livestockAgesByAnimal[animalID]) livestockAgesByAnimal[animalID] = [];
++                        livestockAgesByAnimal[animalID].push({
++                            ageID: String(item.ageID || '').trim(),
++                            ageName: String(item.ageName || '').trim()
++                        });
++                    });
++                    Object.values(livestockAgesByAnimal).forEach(list => {
++                        list.sort((a, b) => a.ageID.localeCompare(b.ageID));
++                    });
+                 </script>
+                 <table class="table-bordered-custom mb-0" id="poultryTable" style="min-width: 900px;">
+                     <thead>
+@@ -131,7 +160,7 @@
+         }
+         if (hp.value === 'yes') {
+             let hasData = false;
+-            document.querySelectorAll('#poultryBody tr').forEach(row => {
++            document.querySelectorAll('#poultryBody tr.poultry-data-row').forEach(row => {
+                 const sel = row.querySelector('.poultry-type-select');
+                 const inp = row.querySelector('input[type="text"]:not(.count-input)');
+                 if ((sel && sel.value) || (inp && inp.value.trim())) hasData = true;
+@@ -163,6 +192,7 @@ window.addPoultryRow = function (rowData = null) {
+     const tbody = document.getElementById('poultryBody');
+     const tr = document.createElement('tr');
+     tr.id = 'poultryRow_' + currentCount;
++    tr.className = 'poultry-data-row';
+     
+     tr.innerHTML = `
+         <td>
+@@ -186,6 +216,13 @@ window.addPoultryRow = function (rowData = null) {
+     `;
+     tbody.appendChild(tr);
+ 
++    // Description row is one merged cell across the existing columns; no new column is added.
++    const descTr = document.createElement('tr');
++    descTr.id = 'poultryDescRow_' + currentCount;
++    descTr.className = 'poultry-desc-row';
++    descTr.dataset.descFor = tr.id;
++    tbody.appendChild(descTr);
++
+     const breedSelect = tr.querySelector('.poultry-type-select');
+     const speciesSelect = tr.querySelector('.poultry-species-select');
+ 
+@@ -276,9 +313,51 @@ window.togglePoultryAgeColumns = function (sel, rowData = null) {
+     });
+     
+     calculateRowTotal(row);
++    updatePoultryAgeDescription(row);
+     if (!rowData) saveFormDataforPart3();
+ };
+ 
++function updatePoultryAgeDescription(row) {
++    const descRow = document.getElementById(
++        row.id.replace('poultryRow_', 'poultryDescRow_')
++    );
++    if (!descRow) return;
++
++    descRow.replaceChildren();
++    const animalID = String(row.querySelector('.poultry-type-select')?.value || '').trim();
++    const records = livestockAgesByAnimal[animalID] || [];
++
++    // One merged cell only: no age columns and no repeated descriptions.
++    const cell = document.createElement('td');
++    cell.colSpan = 10;
++    cell.className = 'poultry-age-desc-cell';
++
++    if (!records.length) {
++        cell.classList.add('poultry-age-desc-empty', 'text-center');
++        cell.textContent = 'တိကျသော အသက်အပိုင်းအခြားမရှိပါ';
++        descRow.appendChild(cell);
++        return;
++    }
++
++    const label = document.createElement('span');
++    label.className = 'poultry-age-desc-label';
++    label.textContent = 'အသက်အပိုင်းအခြား -';
++    cell.appendChild(label);
++
++    let hasValue = false;
++    records.forEach(record => {
++        if (!record.ageName) return;
++        if (hasValue) cell.appendChild(document.createTextNode(' ၊ '));
++        const value = document.createElement('span');
++        value.className = 'poultry-age-desc-value';
++        value.textContent = record.ageName;
++        cell.appendChild(value);
++        hasValue = true;
++    });
++
++    descRow.appendChild(cell);
++}
++
+ function calculateRowTotal(row) {
+     const total = row.querySelector('.total-input');
+     if (total && total.readOnly) {
+@@ -290,7 +369,13 @@ function calculateRowTotal(row) {
+ 
+ window.removeRow = function (rowId) {
+     const r = document.getElementById(rowId);
+-    if (r) r.remove();
++    if (r) {
++        const desc = document.getElementById(
++            rowId.replace('poultryRow_', 'poultryDescRow_')
++        );
++        if (desc) desc.remove();
++        r.remove();
++    }
+     saveFormDataforPart3();
+ };
+ 
+@@ -301,7 +386,7 @@ function saveFormDataforPart3 () {
+     if (radio) data['has_poultry'] = radio.value;
+ 
+     const poultryRows = [];
+-    document.querySelectorAll('#poultryBody tr').forEach(row => {
++    document.querySelectorAll('#poultryBody tr.poultry-data-row').forEach(row => {
+         const rowData = {};
+         row.querySelectorAll('input, select').forEach(inp => {
+             
+@@ -371,7 +456,7 @@ function loadFormDataforPart3() {
+         }
+ 
+         const records = [];
+-        const ani_rows = document.querySelectorAll("#poultryBody tr");
++        const ani_rows = document.querySelectorAll("#poultryBody tr.poultry-data-row");
+ 
+         ani_rows.forEach(row => {
+             const animalID = row.querySelector('select[name*="[breed]"]').value;
+diff --git a/templates/temporaryVillage.html b/templates/temporaryVillage.html
+index abb2123..fa81a5d 100644
+--- a/templates/temporaryVillage.html
++++ b/templates/temporaryVillage.html
+@@ -165,6 +165,60 @@
+     .panel-head h6 i { color: #10b981; }
+     .panel-body { padding: 15px; }
+ 
++    /* ================= ENTRY CARD / TABS ================= */
++    .entry-card { margin-bottom: 16px; }
++    .entry-tabs {
++        display: flex; align-items: stretch; gap: 4px;
++        padding: 8px 12px 0;
++        border-bottom: 1px solid #eef2f0;
++        background: linear-gradient(180deg, #f7fdfa 0%, #ffffff 100%);
++        border-radius: 14px 14px 0 0;
++    }
++    .entry-tab {
++        position: relative; border: 0; background: transparent;
++        padding: 9px 16px 11px;
++        display: inline-flex; align-items: center; gap: 6px;
++        font-size: 0.76rem; font-weight: 800; color: #64748b;
++        cursor: pointer; border-radius: 9px 9px 0 0;
++        transition: background-color 0.15s ease, color 0.15s ease;
++    }
++    .entry-tab i { color: #10b981; }
++    .entry-tab:hover { background: #f1fbf6; color: #047857; }
++    .entry-tab.active { background: #ecfdf5; color: #047857; }
++    .entry-tab.active::after {
++        content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px;
++        height: 2px; border-radius: 2px; background: #10b981;
++    }
++    .entry-pane { display: none; padding: 16px; }
++    .entry-pane.active { display: block; }
++    .entry-form-grid {
++        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
++        gap: 14px 18px;
++    }
++    .entry-row {
++        grid-column: 1 / -1;
++        display: grid; gap: 14px 18px;
++    }
++    .entry-row.location-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++    .entry-row.location-row.single-location { grid-template-columns: minmax(0, 420px); }
++    .entry-form-grid .field-stack { margin-bottom: 0 !important; }
++    .name-field { min-width: 0; }
++    .entry-form-grid .village-alert,
++    .entry-form-grid .import-result,
++    .entry-form-grid .excel-guide { grid-column: 1 / -1; }
++    .entry-form-grid .village-alert,
++    .entry-form-grid .import-result { margin-top: 0; }
++    .entry-form-grid .excel-guide { margin-top: 0; padding-top: 12px; }
++    .entry-form-grid .btn-add-village {
++        grid-column: 1 / -1; width: auto; max-width: 280px; margin-top: 0;
++    }
++    .entry-actions {
++        grid-column: 1 / -1;
++        display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
++    }
++    .entry-actions .btn-import-excel,
++    .entry-actions .btn-sample-excel { flex: 0 0 200px; }
++
+     .count-badge {
+         display: inline-flex; align-items: center; gap: 4px;
+         border-radius: 999px; padding: 3px 9px;
+@@ -235,11 +289,37 @@
+     }
+     .id-note i { color: #0ea5e9; margin-top: 1px; flex-shrink: 0; }
+ 
+-    /* ================= EXCEL IMPORT ================= */
+-    .excel-actions {
+-        display: flex; flex-wrap: wrap; gap: 8px;
+-        margin-top: 10px;
++    /* ================= WARD / VILLAGE CODE FIELDS ================= */
++    .field-stack {
++        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
++        gap: 12px;
++    }
++    .ward-options { display: flex; gap: 8px; }
++    .ward-option { position: relative; flex: 1 1 0; min-width: 0; cursor: pointer; }
++    .ward-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
++    .ward-option span {
++        display: flex; align-items: center; justify-content: center; gap: 5px;
++        min-height: 40px; padding: 7px 10px; border-radius: 9px;
++        border: 1px solid #dfe8e4; background: #ffffff; color: #475569;
++        font-size: 0.78rem; font-weight: 700; line-height: 1.2;
++        transition: background-color 0.15s ease, border-color 0.15s ease,
++                    color 0.15s ease, box-shadow 0.15s ease;
++    }
++    .ward-option input:checked + span {
++        background: #ecfdf5; border-color: #6ee7b7; color: #047857;
++        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.12);
++    }
++    .ward-option input:focus-visible + span {
++        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
++    }
++    .optional-tag {
++        display: inline-flex; align-items: center;
++        background: #f1f5f3; color: #64748b;
++        border-radius: 999px; padding: 1px 6px;
++        font-size: 0.58rem; font-weight: 700; white-space: nowrap;
+     }
++
++    /* ================= EXCEL IMPORT ================= */
+     .btn-import-excel {
+         flex: 1 1 150px; border: 1px solid #bfe8d5; border-radius: 9px; min-height: 38px;
+         padding: 7px 12px;
+@@ -344,6 +424,27 @@
+         line-height: 1.45;
+     }
+     .qv-name i { color: #10b981; font-size: 0.7rem; flex-shrink: 0; }
++    .village-code {
++        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++        font-size: 0.73rem; font-weight: 600; color: #334155;
++        overflow-wrap: anywhere;
++    }
++    .village-code.is-empty { color: #94a3b8; font-weight: 500; }
++    .ward-pill {
++        display: inline-flex; align-items: center;
++        border-radius: 999px; padding: 3px 9px;
++        background: #ecfdf5; border: 1px solid #a7f3d0;
++        color: #047857; font-size: 0.65rem; font-weight: 800;
++        white-space: nowrap;
++    }
++    .ward-pill.is-empty { background: #f1f5f3; border-color: #e2e8f0; color: #94a3b8; }
++
++    .success-modal-icon {
++        width: 58px; height: 58px; border-radius: 50%;
++        display: inline-flex; align-items: center; justify-content: center;
++        background: #ecfdf5; border: 1px solid #a7f3d0;
++        color: #047857; font-size: 1.65rem;
++    }
+ 
+     .table-state { text-align: center; padding: 34px 16px !important; }
+     .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+@@ -432,6 +533,11 @@
+         .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+         .filter-grid .filter-actions { grid-column: 1 / -1; justify-content: flex-end; }
+     }
++    @media (max-width: 991.98px) {
++        .entry-form-grid { grid-template-columns: 1fr; }
++        .entry-row.location-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++        .entry-row.location-row.single-location { grid-template-columns: 1fr; }
++    }
+     @media (max-width: 575.98px) {
+         .village-hero { padding: 15px; }
+         .hero-main { gap: 10px; }
+@@ -447,6 +553,10 @@
+         .btn-filter-submit, .btn-filter-reset { min-width: 0; width: 100%; }
+         .filter-head-text .filter-sub { display: none; }
+         .panel-body { padding: 13px; }
++        .field-stack { grid-template-columns: 1fr; }
++        .entry-row.location-row { grid-template-columns: 1fr; }
++        .entry-actions .btn-import-excel,
++        .entry-actions .btn-sample-excel { flex: 1 1 100%; }
+     }
+ </style>
+ {% endblock %}
+@@ -490,6 +600,180 @@
+     </div>
+     {% endif %}
+ 
++    <div class="panel-card entry-card">
++        <div class="entry-tabs" role="tablist" aria-label="Village entry methods">
++            <button type="button" class="entry-tab active" id="tabManualEntry"
++                    data-entry-target="paneManualEntry" role="tab"
++                    aria-selected="true" aria-controls="paneManualEntry">
++                <i class="bi bi-pencil-square"></i> ကိုယ်တိုင်ထည့်သွင်းမည်
++            </button>
++            <button type="button" class="entry-tab" id="tabExcelImport"
++                    data-entry-target="paneExcelImport" role="tab"
++                    aria-selected="false" aria-controls="paneExcelImport">
++                <i class="bi bi-file-earmark-excel-fill"></i> Excel ဖိုင် ဖြင့်ထည့်သွင်းမည်။
++            </button>
++        </div>
++
++        <div class="entry-pane active" id="paneManualEntry" role="tabpanel" aria-labelledby="tabManualEntry">
++            <div class="add-intro">
++                <i class="bi bi-info-circle-fill"></i>
++                ခရိုင်၊ မြို့နယ်နှင့် ကျေးရွာအုပ်စု ရွေးချယ်ပါ။ Ward သို့မဟုတ် Vg ကို ရွေးပြီး ကျေးရွာအမည် ဖြည့်ပါ။ ကျေးရွာကုဒ်ကို မသိပါက ဗလာထားနိုင်ပါသည်။
++            </div>
++
++            <form class="add-form entry-form-grid" id="addVillageForm" autocomplete="off">
++                <div class="entry-row location-row">
++                    <div class="mb-0">
++                        <label class="form-label" for="addDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင် <span class="req">*</span></label>
++                        <select id="addDistrict" class="form-select" required {% if not districts %}disabled{% endif %}>
++                            <option value="">— ခရိုင် ရွေးချယ်ပါ —</option>
++                            {% for item in districts %}
++                            <option value="{{ item.districtID }}" {% if item.districtID == selected_district %}selected{% endif %}>{{ item.districtName or item.districtID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++
++                    <div class="mb-0">
++                        <label class="form-label" for="addTownship"><i class="bi bi-building-fill"></i>မြို့နယ် <span class="req">*</span></label>
++                        <select id="addTownship" class="form-select" required {% if not townships %}disabled{% endif %}>
++                            <option value="">— မြို့နယ် ရွေးချယ်ပါ —</option>
++                            {% for item in townships %}
++                            <option value="{{ item.townshipID }}" {% if item.townshipID == selected_township %}selected{% endif %}>{{ item.townshipName or item.townshipID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++
++                    <div class="mb-0">
++                        <label class="form-label" for="addQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
++                        <select id="addQv" class="form-select" required>
++                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
++                            {% for item in qvs %}
++                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++                </div>
++
++                <div class="field-stack">
++                    <div>
++                        <label class="form-label"><i class="bi bi-diagram-2-fill"></i>ရပ်ကွက် / ကျေးရွာ <span class="req">*</span></label>
++                        <div class="ward-options" role="radiogroup" aria-label="Ward or Vg">
++                            <label class="ward-option">
++                                <input type="radio" name="wardOrVg" value="Ward" id="addWard">
++                                <span><i class="bi bi-building"></i>ရပ်ကွက်</span>
++                            </label>
++                            <label class="ward-option">
++                                <input type="radio" name="wardOrVg" value="Vg" id="addVg">
++                                <span><i class="bi bi-house"></i>ကျေးရွာ</span>
++                            </label>
++                        </div>
++                    </div>
++                    <div>
++                        <label class="form-label" for="villageCode">
++                            <i class="bi bi-upc-scan"></i>ကျေးရွာကုဒ်
++                            <span class="optional-tag">မသိပါက ဗလာထားနိုင်ပါသည်</span>
++                        </label>
++                        <input type="text" id="villageCode" class="form-control"
++                               maxlength="50" placeholder="ဥပမာ - 219161"
++                               {% if not qvs %}disabled{% endif %}>
++                    </div>
++                </div>
++
++                <div class="name-field">
++                    <label class="form-label" for="villageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
++                    <input type="text" id="villageName" name="villageName" class="form-control"
++                           maxlength="150" placeholder="ဥပမာ - ကန်ရိုးကျေးရွာ" required
++                           {% if not qvs %}disabled{% endif %}>
++                    <div class="name-hint">
++                        <i class="bi bi-translate"></i>
++                        <span>မြန်မာစာ သို့မဟုတ် English ဖြင့် ရေးသားနိုင်ပါသည်။ ကျေးရွာအမည် ထပ်နေပါက စနစ်မှ လက်မခံပါ။</span>
++                    </div>
++                </div>
++
++                <div id="addAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
++
++                <button type="submit" class="btn-add-village" id="btnAddVillage" {% if not qvs %}disabled{% endif %}>
++                    <i class="bi bi-plus-circle"></i>
++                    ကျေးရွာ ထည့်သွင်းမည်
++                </button>
++            </form>
++        </div>
++
++        <div class="entry-pane" id="paneExcelImport" role="tabpanel" aria-labelledby="tabExcelImport">
++            <div class="add-intro">
++                <i class="bi bi-info-circle-fill"></i>
++                Excel ဖိုင်ဖြင့် ကျေးရွာများကို တစ်ကြောင်းချင်း ထည့်စရာမလိုဘဲ တစ်ခါတည်း ထည့်သွင်းနိုင်ပါသည်။ နမူနာဖိုင်ကို ဒေါင်းလုဒ်လုပ်ပြီး ပြင်ဆင်နိုင်ပါသည်။
++            </div>
++
++            <form class="add-form entry-form-grid" id="villageImportForm" autocomplete="off">
++                <div class="entry-row location-row">
++                    <div class="mb-0">
++                        <label class="form-label" for="importDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင် <span class="req">*</span></label>
++                        <select id="importDistrict" class="form-select" required {% if not districts %}disabled{% endif %}>
++                            <option value="">— ခရိုင် ရွေးချယ်ပါ —</option>
++                            {% for item in districts %}
++                            <option value="{{ item.districtID }}" {% if item.districtID == selected_district %}selected{% endif %}>{{ item.districtName or item.districtID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="importTownship"><i class="bi bi-building-fill"></i>မြို့နယ် <span class="req">*</span></label>
++                        <select id="importTownship" class="form-select" required {% if not townships %}disabled{% endif %}>
++                            <option value="">— မြို့နယ် ရွေးချယ်ပါ —</option>
++                            {% for item in townships %}
++                            <option value="{{ item.townshipID }}" {% if item.townshipID == selected_township %}selected{% endif %}>{{ item.townshipName or item.townshipID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="importQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
++                        <select id="importQv" class="form-select" required>
++                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
++                            {% for item in qvs %}
++                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++                </div>
++
++                <div class="mb-0">
++                    <label class="form-label" for="importFile"><i class="bi bi-file-earmark-excel-fill"></i>Excel ဖိုင် (.xlsx) <span class="req">*</span></label>
++                    <input type="file" id="importFile" class="form-control" accept=".xlsx" required {% if not qvs %}disabled{% endif %}>
++                    <div class="name-hint">
++                        <i class="bi bi-info-circle"></i>
++                        <span>ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအောက်တွင် Excel ဖိုင်၏ ကျေးရွာအမည်များကို ထည့်သွင်းပါမည်။</span>
++                    </div>
++                </div>
++
++                <div class="excel-guide">
++                    <div class="excel-guide-title"><i class="bi bi-list-check"></i> Excel ဖိုင် ပြင်ဆင်ပုံ</div>
++                    <ul>
++                        <li>ဖိုင်တွင် စာမျက်နှာ (sheet) တစ်ခုတည်း ပါဝင်ရမည်။</li>
++                        <li><code>villageName</code> နှင့် <code>Ward and Vg</code> ကော်လံများ ပါဝင်ရမည်။ <code>Ward/Village_ Pcode</code> ကော်လံကို မထည့်တော့ဘဲလည်း ရပါသည်။</li>
++                        <li><code>Ward and Vg</code> က အမျိုးအစား (ဥပမာ - <code>Vg</code>)၊ <code>Ward/Village_ Pcode</code> က ကုဒ် (ဥပမာ - <code>219161</code>) ဖြစ်ပါသည်။</li>
++                        <li><code>No.</code> က အစဉ်နံပါတ်သာ ဖြစ်ပြီး မထည့်လည်းရပါသည်။ villageID ကို စနစ်မှ အလိုအလျောက် သတ်မှတ်ပါသည်။</li>
++                        <li>ကော်လံ ၄ ခုအထိ လက်ခံပါသည်။ မူရင်း ၁ သို့မဟုတ် ၂ ကော်လံ (<code>No.</code>, <code>villageName</code>) ဖိုင်ဟောင်းများကိုလည်း ဆက်လက် လက်ခံပါသည်။</li>
++                        <li>ကျေးရွာအမည်နှင့် Ward and Vg ကော်လံများတွင် ဗလာ မထားရပါ။ Ward and Vg တွင် <code>Ward</code> သို့မဟုတ် <code>Vg</code> သာ ထည့်ပါ။</li>
++                        <li><code>Ward/Village_ Pcode</code> ကုဒ်ကို မသိပါက ဗလာထားနိုင်ပါသည်။ ကျေးရွာအသစ်ထည့်သည့်အခါလည်း ဗလာထားနိုင်ပါသည်။</li>
++                        <li>ကျေးရွာအုပ်စုအတွင်း ရှိပြီးသား ကျေးရွာအမည် သို့မဟုတ် Pcode များကို ကျော်လွှားမည်။</li>
++                        <li>ပထမတန်းသည် ကော်လံခေါင်းစဉ် ဖြစ်ရမည်။</li>
++                    </ul>
++                </div>
++
++                <div id="importAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
++                <div id="importResult" class="import-result d-none" aria-live="polite"></div>
++
++                <div class="entry-actions">
++                    <a class="btn-sample-excel" href="/api/township/temporary-villages/sample-excel">
++                        <i class="bi bi-download"></i> နမူနာ Excel ဖိုင်
++                    </a>
++                    <button type="submit" class="btn-import-excel" id="btnImportVillages">
++                        <i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
++                    </button>
++                </div>
++            </form>
++        </div>
++    </div>
++
+     <form method="GET" action="/township/temporary-village" id="villageFilterForm">
+         <div class="filter-card mb-3">
+             <div class="filter-card-head">
+@@ -546,126 +830,46 @@
+         </div>
+     </form>
+ 
+-    <div class="row g-3">
+-        <div class="col-xl-4 col-lg-5">
+-            <div class="panel-card">
+-                <div class="panel-head">
+-                    <h6><span class="add-card-accent"><i class="bi bi-plus-lg"></i></span> ကျေးရွာအသစ် ထည့်သွင်းရန်</h6>
+-                </div>
+-                <div class="panel-body">
+-                    <div class="add-intro">
+-                        <i class="bi bi-info-circle-fill"></i>
+-                        ကျေးရွာအသစ် ထည့်သွင်းရန် ခရိုင်၊ မြို့နယ်နှင့် ကျေးရွာအုပ်စု ရွေးချယ်ပြီး ကျေးရွာအမည်ကို ဖြည့်ပါ။
+-                    </div>
+-
+-                    <form class="add-form" id="addVillageForm" autocomplete="off">
+-                        <div class="mb-3">
+-                            <label class="form-label" for="addDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင် <span class="req">*</span></label>
+-                            <select id="addDistrict" class="form-select" required {% if not districts %}disabled{% endif %}>
+-                                <option value="">— ခရိုင် ရွေးချယ်ပါ —</option>
+-                                {% for item in districts %}
+-                                <option value="{{ item.districtID }}" {% if item.districtID == selected_district %}selected{% endif %}>{{ item.districtName or item.districtID }}</option>
+-                                {% endfor %}
+-                            </select>
+-                        </div>
+-
+-                        <div class="mb-3">
+-                            <label class="form-label" for="addTownship"><i class="bi bi-building-fill"></i>မြို့နယ် <span class="req">*</span></label>
+-                            <select id="addTownship" class="form-select" required {% if not townships %}disabled{% endif %}>
+-                                <option value="">— မြို့နယ် ရွေးချယ်ပါ —</option>
+-                                {% for item in townships %}
+-                                <option value="{{ item.townshipID }}" {% if item.townshipID == selected_township %}selected{% endif %}>{{ item.townshipName or item.townshipID }}</option>
+-                                {% endfor %}
+-                            </select>
+-                        </div>
+-
+-                        <div class="mb-3">
+-                            <label class="form-label" for="addQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
+-                            <select id="addQv" class="form-select" required>
+-                                <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
+-                                {% for item in qvs %}
+-                                <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
+-                                {% endfor %}
+-                            </select>
+-                        </div>
+-
+-                        <div class="mb-0">
+-                            <label class="form-label" for="villageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
+-                            <input type="text" id="villageName" name="villageName" class="form-control"
+-                                   maxlength="150" placeholder="ဥပမာ - ကန်ရိုးကျေးရွာ" required
+-                                   {% if not qvs %}disabled{% endif %}>
+-                            <div class="name-hint">
+-                                <i class="bi bi-translate"></i>
+-                                <span>မြန်မာစာ သို့မဟုတ် English ဖြင့် ရေးသားနိုင်ပါသည်။ ကျေးရွာအမည် ထပ်နေပါက စနစ်မှ လက်မခံပါ။</span>
++    <div class="panel-card list-card">
++        <div class="panel-head">
++            <h6>
++                <i class="bi bi-table"></i>
++                ကျေးရွာစာရင်း
++                <span class="count-badge" id="listCountBadge">{{ filtered_total }} ရွာ</span>
++            </h6>
++            <button type="button" class="btn-icon" id="refreshBtn" title="ပြန်လည်ရယူရန်">
++                <i class="bi bi-arrow-clockwise"></i>
++            </button>
++        </div>
++        <div class="table-responsive">
++            <table class="village-table">
++                <thead>
++                    <tr>
++                        <th>စဉ်</th>
++                        <th>ကျေးရွာအမည်</th>
++                        <th>ကျေးရွာကုဒ်</th>
++                        <th>Ward/Vg</th>
++                        <th>ကျေးရွာအုပ်စု</th>
++                        <th class="text-center">လုပ်ဆောင်ချက်များ</th>
++                    </tr>
++                </thead>
++                <tbody id="villageTbody">
++                    <tr>
++                        <td colspan="6" class="table-state">
++                            <div class="empty-state">
++                                <div class="empty-icon"><i class="bi bi-house"></i></div>
++                                <div class="empty-title">ကျေးရွာစာရင်း ဖွင့်နေသည်…</div>
+                             </div>
+-                        </div>
+-
+-                        <div id="addAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
+-
+-                        <button type="submit" class="btn-add-village" id="btnAddVillage" {% if not qvs %}disabled{% endif %}>
+-                            <i class="bi bi-plus-circle"></i>
+-                            ကျေးရွာ ထည့်သွင်းမည်
+-                        </button>
+-                    </form>
+-
+-                    <div class="id-note">
+-                        <!-- <i class="bi bi-upc-scan"></i> -->
+-                        <span></span>
+-                    </div>
+-
+-                    <div class="excel-actions">
+-                        <button type="button" class="btn-import-excel" id="btnOpenImportExcel" {% if not qvs %}disabled{% endif %}>
+-                            <i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
+-                        </button>
+-                        <a class="btn-sample-excel" href="/api/township/temporary-villages/sample-excel">
+-                            <i class="bi bi-download"></i> နမူနာ Excel ဖိုင်
+-                        </a>
+-                    </div>
+-                </div>
+-            </div>
++                        </td>
++                    </tr>
++                </tbody>
++            </table>
+         </div>
+-
+-        <div class="col-xl-8 col-lg-7">
+-            <div class="panel-card list-card">
+-                <div class="panel-head">
+-                    <h6>
+-                        <i class="bi bi-table"></i>
+-                        ကျေးရွာစာရင်း
+-                        <span class="count-badge" id="listCountBadge">{{ filtered_total }} ရွာ</span>
+-                    </h6>
+-                    <button type="button" class="btn-icon" id="refreshBtn" title="ပြန်လည်ရယူရန်">
+-                        <i class="bi bi-arrow-clockwise"></i>
+-                    </button>
+-                </div>
+-                <div class="table-responsive">
+-                    <table class="village-table">
+-                        <thead>
+-                            <tr>
+-                                <th>စဉ်</th>
+-                                <th>ကျေးရွာအမည်</th>
+-                                <th>ကျေးရွာအုပ်စု</th>
+-                                <th class="text-center">လုပ်ဆောင်ချက်များ</th>
+-                            </tr>
+-                        </thead>
+-                        <tbody id="villageTbody">
+-                            <tr>
+-                                <td colspan="4" class="table-state">
+-                                    <div class="empty-state">
+-                                        <div class="empty-icon"><i class="bi bi-house"></i></div>
+-                                        <div class="empty-title">ကျေးရွာစာရင်း ဖွင့်နေသည်…</div>
+-                                    </div>
+-                                </td>
+-                            </tr>
+-                        </tbody>
+-                    </table>
+-                </div>
+-                <div class="panel-foot d-none" id="villagePager">
+-                    <span class="pager-info" id="pagerStatus"></span>
+-                    <nav class="village-pager" aria-label="ကျေးရွာစာရင်း စာမျက်နှာ">
+-                        <ul class="pagination pagination-sm mb-0" id="pagerList"></ul>
+-                    </nav>
+-                </div>
+-            </div>
++        <div class="panel-foot d-none" id="villagePager">
++            <span class="pager-info" id="pagerStatus"></span>
++            <nav class="village-pager" aria-label="ကျေးရွာစာရင်း စာမျက်နှာ">
++                <ul class="pagination pagination-sm mb-0" id="pagerList"></ul>
++            </nav>
+         </div>
+     </div>
+ </div>
+@@ -689,6 +893,29 @@
+                             {% endfor %}
+                         </select>
+                     </div>
++                    <div class="field-stack mb-3">
++                        <div>
++                            <label class="form-label"><i class="bi bi-diagram-2-fill"></i>Ward / Vg <span class="req">*</span></label>
++                            <div class="ward-options" role="radiogroup" aria-label="Ward or Vg">
++                                <label class="ward-option">
++                                    <input type="radio" name="editWardOrVg" value="Ward" id="editWard">
++                                    <span><i class="bi bi-building"></i>Ward</span>
++                                </label>
++                                <label class="ward-option">
++                                    <input type="radio" name="editWardOrVg" value="Vg" id="editVg">
++                                    <span><i class="bi bi-house"></i>Vg</span>
++                                </label>
++                            </div>
++                        </div>
++                        <div>
++                            <label class="form-label" for="editVillageCode">
++                                <i class="bi bi-upc-scan"></i>ကျေးရွာကုဒ်
++                                <span class="optional-tag">မသိပါက ဗလာထားနိုင်ပါသည်</span>
++                            </label>
++                            <input type="text" id="editVillageCode" class="form-control" maxlength="50"
++                                   placeholder="ဥပမာ - 219161">
++                        </div>
++                    </div>
+                     <div class="mb-0">
+                         <label class="form-label" for="editVillageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
+                         <input type="text" id="editVillageName" class="form-control" maxlength="150" required>
+@@ -731,79 +958,19 @@
+     </div>
+ </div>
+ 
+-<div class="modal fade" id="villageImportModal" tabindex="-1" aria-labelledby="villageImportModalLabel" aria-hidden="true">
+-    <div class="modal-dialog modal-dialog-centered">
+-        <div class="modal-content">
+-            <form id="villageImportForm" autocomplete="off">
+-                <div class="modal-header">
+-                    <h5 class="modal-title" id="villageImportModalLabel">
+-                        <i class="bi bi-file-earmark-excel-fill me-2"></i>Excel ဖိုင်ဖြင့် ကျေးရွာ ထည့်သွင်းရန်
+-                    </h5>
+-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="ပိတ်မည်"></button>
+-                </div>
+-                <div class="modal-body">
+-                    <div class="mb-3">
+-                        <label class="form-label" for="importDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင် <span class="req">*</span></label>
+-                        <select id="importDistrict" class="form-select" required {% if not districts %}disabled{% endif %}>
+-                            <option value="">— ခရိုင် ရွေးချယ်ပါ —</option>
+-                            {% for item in districts %}
+-                            <option value="{{ item.districtID }}" {% if item.districtID == selected_district %}selected{% endif %}>{{ item.districtName or item.districtID }}</option>
+-                            {% endfor %}
+-                        </select>
+-                    </div>
+-                    <div class="mb-3">
+-                        <label class="form-label" for="importTownship"><i class="bi bi-building-fill"></i>မြို့နယ် <span class="req">*</span></label>
+-                        <select id="importTownship" class="form-select" required {% if not townships %}disabled{% endif %}>
+-                            <option value="">— မြို့နယ် ရွေးချယ်ပါ —</option>
+-                            {% for item in townships %}
+-                            <option value="{{ item.townshipID }}" {% if item.townshipID == selected_township %}selected{% endif %}>{{ item.townshipName or item.townshipID }}</option>
+-                            {% endfor %}
+-                        </select>
+-                    </div>
+-                    <div class="mb-3">
+-                        <label class="form-label" for="importQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
+-                        <select id="importQv" class="form-select" required>
+-                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
+-                            {% for item in qvs %}
+-                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
+-                            {% endfor %}
+-                        </select>
+-                    </div>
+-                    <div class="mb-0">
+-                        <label class="form-label" for="importFile"><i class="bi bi-file-earmark-excel-fill"></i>Excel ဖိုင် (.xlsx) <span class="req">*</span></label>
+-                        <input type="file" id="importFile" class="form-control" accept=".xlsx" required {% if not qvs %}disabled{% endif %}>
+-                        <div class="name-hint">
+-                            <i class="bi bi-info-circle"></i>
+-                            <span>ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအောက်တွင် Excel ဖိုင်၏ ကျေးရွာအမည်များကို ထည့်သွင်းပါမည်။</span>
+-                        </div>
+-                    </div>
+-
+-                    <div class="excel-guide">
+-                        <div class="excel-guide-title"><i class="bi bi-list-check"></i> Excel ဖိုင် ပြင်ဆင်ပုံ</div>
+-                        <ul>
+-                            <li>ဖိုင်တွင် စာမျက်နှာ (sheet) တစ်ခုတည်း ပါဝင်ရမည်။</li>
+-                            <li>ကော်လံ နှစ်ခုထက် မပိုရပါ။ ကော်လံ တစ်ခု (<code>villageName</code>) သို့မဟုတ် ကော်လံ နှစ်ခု (<code>No.</code> နှင့် <code>villageName</code>) ပါဝင်နိုင်သည်။</li>
+-                            <li>ကော်လံ နှစ်ခုဖြစ်ပါက ပထမကော်လံမှာ <code>No.</code> (ကျေးရွာ အရေအတွက်) ဖြစ်ရမည်။</li>
+-                            <li>ဒုတိယကော်လံမှာ <code>villageName</code> အတိအကျ ဖြစ်ရမည်။</li>
+-                            <li>ကျေးရွာအမည် ကော်လံတွင် ဗလာ မထားရပါ။</li>
+-                            <li>ကျေးရွာအုပ်စုအတွင်း ရှိပြီးသား ကျေးရွာအမည်များကို ကျော်လွှားမည်။</li>
+-                            <li>ပထမတန်းသည် ကော်လံခေါင်းစဉ် ဖြစ်ရမည်။</li>
+-                        </ul>
+-                    </div>
+-
+-                    <div id="importAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
+-                    <div id="importResult" class="import-result d-none" aria-live="polite"></div>
+-                </div>
+-                <div class="modal-footer">
+-                    <a class="btn btn-light border me-auto" href="/api/township/temporary-villages/sample-excel">
+-                        <i class="bi bi-download"></i> နမူနာဖိုင်
+-                    </a>
+-                    <button type="button" class="btn btn-light border" data-bs-dismiss="modal">မလုပ်တော့ပါ</button>
+-                    <button type="submit" class="btn btn-success" id="btnImportVillages">
+-                        <i class="bi bi-upload"></i> ထည့်သွင်းမည်
+-                    </button>
+-                </div>
+-            </form>
++<div class="modal fade" id="villageDeleteSuccessModal" tabindex="-1" aria-labelledby="villageDeleteSuccessModalLabel" aria-hidden="true">
++    <div class="modal-dialog modal-dialog-centered modal-sm">
++        <div class="modal-content text-center">
++            <div class="modal-body p-4">
++                <div class="success-modal-icon"><i class="bi bi-check-circle-fill"></i></div>
++                <h5 class="modal-title mt-3 mb-2" id="villageDeleteSuccessModalLabel">ကျေးရွာ ဖျက်ပြီးပါပြီ</h5>
++                <p class="mb-0 text-muted" id="deleteSuccessMessage"></p>
++            </div>
++            <div class="modal-footer border-0 justify-content-center pb-3">
++                <button type="button" class="btn btn-success" data-bs-dismiss="modal">
++                    <i class="bi bi-check2"></i> နားလည်ပါသည်
++                </button>
++            </div>
+         </div>
+     </div>
+ </div>
+@@ -836,6 +1003,7 @@
+     const addTownship = document.getElementById('addTownship');
+     const addQv = document.getElementById('addQv');
+     const nameInput = document.getElementById('villageName');
++    const villageCodeInput = document.getElementById('villageCode');
+     const addAlert = document.getElementById('addAlert');
+     const addBtn = document.getElementById('btnAddVillage');
+     const tbody = document.getElementById('villageTbody');
+@@ -850,13 +1018,17 @@
+     const editForm = document.getElementById('villageEditForm');
+     const editQv = document.getElementById('editQv');
+     const editVillageName = document.getElementById('editVillageName');
++    const editVillageCode = document.getElementById('editVillageCode');
+     const editAlert = document.getElementById('editAlert');
+     const editSaveBtn = document.getElementById('btnSaveVillageEdit');
+     const deleteModalEl = document.getElementById('villageDeleteModal');
+     const deleteNameEl = document.getElementById('deleteVillageName');
+     const deleteAlert = document.getElementById('deleteAlert');
+     const deleteConfirmBtn = document.getElementById('btnConfirmDeleteVillage');
+-    const importModalEl = document.getElementById('villageImportModal');
++    const deleteSuccessModalEl = document.getElementById('villageDeleteSuccessModal');
++    const deleteSuccessMessage = document.getElementById('deleteSuccessMessage');
++    const entryTabs = Array.from(document.querySelectorAll('.entry-tab'));
++    const excelEntryTab = document.getElementById('tabExcelImport');
+     const importForm = document.getElementById('villageImportForm');
+     const importDistrict = document.getElementById('importDistrict');
+     const importTownship = document.getElementById('importTownship');
+@@ -865,7 +1037,6 @@
+     const importAlert = document.getElementById('importAlert');
+     const importResult = document.getElementById('importResult');
+     const importBtn = document.getElementById('btnImportVillages');
+-    const openImportBtn = document.getElementById('btnOpenImportExcel');
+ 
+     let totalVillages = Number(dataEl.dataset.totalVillages || 0);
+     let totalFiltered = Number(dataEl.dataset.filteredTotal || 0);
+@@ -887,11 +1058,64 @@
+ 
+     const ADD_BUTTON_HTML = '<i class="bi bi-plus-circle"></i> ကျေးရွာ ထည့်သွင်းမည်';
+     const ADD_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ထည့်သွင်းနေသည်…';
+-    const IMPORT_BUTTON_HTML = '<i class="bi bi-upload"></i> ထည့်သွင်းမည်';
++    const IMPORT_BUTTON_HTML = '<i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်';
+     const IMPORT_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ထည့်သွင်းနေသည်…';
+     const DELETE_BUTTON_HTML = '<i class="bi bi-trash"></i> ဖျက်မည်';
+     const DELETE_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ဖျက်နေသည်…';
+ 
++    function selectedWard(form, name) {
++        const checked = form && form.querySelector(
++            'input[name="' + name + '"]:checked'
++        );
++        return checked ? checked.value : '';
++    }
++
++    function setWard(form, name, value) {
++        if (!form) return;
++        form.querySelectorAll('input[name="' + name + '"]').forEach(function (radio) {
++            radio.checked = radio.value === String(value || '');
++        });
++    }
++
++    function setupEntryTabs() {
++        entryTabs.forEach(function (tab) {
++            tab.addEventListener('click', function () {
++                const targetId = tab.dataset.entryTarget;
++                entryTabs.forEach(function (other) {
++                    const isActive = other === tab;
++                    other.classList.toggle('active', isActive);
++                    other.setAttribute('aria-selected', isActive ? 'true' : 'false');
++                });
++                document.querySelectorAll('.entry-pane').forEach(function (pane) {
++                    pane.classList.toggle('active', pane.id === targetId);
++                });
++                if (tab === excelEntryTab) prepareImportForm();
++            });
++        });
++    }
++
++    function showDeleteSuccess(message) {
++        if (deleteSuccessMessage) {
++            deleteSuccessMessage.textContent = message
++                || 'ကျေးရွာကို အောင်မြင်စွာ ဖျက်ပြီးပါပြီ။';
++        }
++        if (!deleteSuccessModalEl || !window.bootstrap) return;
++
++        const showModal = function () {
++            window.bootstrap.Modal.getOrCreateInstance(deleteSuccessModalEl).show();
++        };
++        // Wait for the confirmation dialog to finish closing before showing
++        // the success dialog, so the two backdrops do not overlap.
++        const deleteModal = deleteModalEl
++            ? window.bootstrap.Modal.getInstance(deleteModalEl)
++            : null;
++        if (deleteModal) {
++            deleteModalEl.addEventListener('hidden.bs.modal', showModal, { once: true });
++        } else {
++            showModal();
++        }
++    }
++
+     function fillOptions(select, items, valueKey, labelKey, placeholder, selectedValue) {
+         if (!select) return;
+         const previous = selectedValue !== undefined && selectedValue !== null
+@@ -1012,7 +1236,7 @@
+     function tableStateRow(iconClass, title, text, extraClass) {
+         const tr = document.createElement('tr');
+         const td = document.createElement('td');
+-        td.colSpan = 4;
++        td.colSpan = 6;
+         td.className = 'table-state ' + (extraClass || '');
+ 
+         const wrap = document.createElement('div');
+@@ -1093,6 +1317,18 @@
+             nameSpan.textContent = row.villageName || '—';
+             nameTd.appendChild(nameSpan);
+ 
++            const codeTd = document.createElement('td');
++            const codeSpan = document.createElement('span');
++            codeSpan.className = 'village-code' + (row.villageCode ? '' : ' is-empty');
++            codeSpan.textContent = row.villageCode || '—';
++            codeTd.appendChild(codeSpan);
++
++            const wardTd = document.createElement('td');
++            const wardPill = document.createElement('span');
++            wardPill.className = 'ward-pill' + (row.wardOrVg ? '' : ' is-empty');
++            wardPill.textContent = row.wardOrVg || '—';
++            wardTd.appendChild(wardPill);
++
+             const qvTd = document.createElement('td');
+             const qvSpan = document.createElement('span');
+             qvSpan.className = 'qv-name';
+@@ -1129,6 +1365,8 @@
+ 
+             tr.appendChild(noTd);
+             tr.appendChild(nameTd);
++            tr.appendChild(codeTd);
++            tr.appendChild(wardTd);
+             tr.appendChild(qvTd);
+             tr.appendChild(actionTd);
+             fragment.appendChild(tr);
+@@ -1387,11 +1625,7 @@
+         importResult.classList.remove('d-none');
+     }
+ 
+-    async function openImportModal() {
+-        clearImportAlert();
+-        clearImportResult();
+-        if (importFile) importFile.value = '';
+-
++    async function prepareImportForm() {
+         const district = (addDistrict && addDistrict.value) || activeDistrict;
+         const township = (addTownship && addTownship.value) || activeTownship;
+         const qv = (addQv && addQv.value) || activeQv;
+@@ -1400,10 +1634,6 @@
+         if (importTownship) importTownship.value = township;
+         if (importQv) importQv.value = qv;
+ 
+-        if (importModalEl && window.bootstrap) {
+-            window.bootstrap.Modal.getOrCreateInstance(importModalEl).show();
+-        }
+-
+         if (!district) return;
+         try {
+             await populateTownships(district, importTownship, importQv, township);
+@@ -1450,6 +1680,8 @@
+             editQv.appendChild(current);
+         }
+         if (editVillageName) editVillageName.value = row.villageName || '';
++        if (editVillageCode) editVillageCode.value = row.villageCode || '';
++        setWard(editForm, 'editWardOrVg', row.wardOrVg);
+         clearEditAlert();
+ 
+         if (editModalEl && window.bootstrap) {
+@@ -1540,7 +1772,7 @@
+             }
+ 
+             pendingDelete = null;
+-            showAddAlert('success', payload.message || 'ကျေးရွာကို ဖျက်ပြီးပါပြီ။');
++            showDeleteSuccess(payload.message || 'ကျေးရွာကို အောင်မြင်စွာ ဖျက်ပြီးပါပြီ။');
+             updateTotal(Math.max(0, totalVillages - 1));
+             await loadVillages(activeDistrict, activeTownship, activeQv, currentPage, true);
+         } catch (err) {
+@@ -1673,6 +1905,8 @@
+             const township = addTownship ? addTownship.value : '';
+             const qv = addQv ? addQv.value : '';
+             const name = nameInput ? nameInput.value.trim() : '';
++            const ward = selectedWard(addForm, 'wardOrVg');
++            const code = villageCodeInput ? villageCodeInput.value.trim() : '';
+ 
+             if (!district) {
+                 showAddAlert('warning', 'ခရိုင် တစ်ခု ရွေးချယ်ပါ။');
+@@ -1694,8 +1928,17 @@
+                 if (nameInput) nameInput.focus();
+                 return;
+             }
++            if (!ward) {
++                showAddAlert('warning', 'Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။');
++                const firstWard = addForm
++                    ? addForm.querySelector('input[name="wardOrVg"]')
++                    : null;
++                if (firstWard) firstWard.focus();
++                return;
++            }
+ 
+             if (nameInput) nameInput.disabled = true;
++            if (villageCodeInput) villageCodeInput.disabled = true;
+             if (addDistrict) addDistrict.disabled = true;
+             if (addTownship) addTownship.disabled = true;
+             if (addQv) addQv.disabled = true;
+@@ -1713,7 +1956,9 @@
+                         district: district,
+                         township: township,
+                         qv: qv,
+-                        villageName: name
++                        villageName: name,
++                        wardOrVg: ward,
++                        villageCode: code
+                     })
+                 });
+ 
+@@ -1733,6 +1978,7 @@
+                 updateTotal(totalVillages + 1);
+ 
+                 if (nameInput) nameInput.value = '';
++                if (villageCodeInput) villageCodeInput.value = '';
+                 if (addDistrict) addDistrict.value = created.districtID || district;
+                 if (addTownship) addTownship.value = created.townshipID || township;
+                 if (addQv) addQv.value = created.QVID || qv;
+@@ -1754,6 +2000,7 @@
+                 showAddAlert('danger', err && err.message ? err.message : 'ကျေးရွာ ထည့်သွင်းမရပါ။');
+             } finally {
+                 if (nameInput) nameInput.disabled = false;
++                if (villageCodeInput) villageCodeInput.disabled = false;
+                 if (addDistrict) addDistrict.disabled = false;
+                 if (addTownship) addTownship.disabled = false;
+                 if (addQv) addQv.disabled = false;
+@@ -1770,6 +2017,8 @@
+ 
+             const newQv = editQv ? editQv.value : '';
+             const newName = editVillageName ? editVillageName.value.trim() : '';
++            const newWard = selectedWard(editForm, 'editWardOrVg');
++            const newCode = editVillageCode ? editVillageCode.value.trim() : '';
+ 
+             if (!newQv) {
+                 showEditAlert('warning', 'ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။');
+@@ -1781,6 +2030,14 @@
+                 if (editVillageName) editVillageName.focus();
+                 return;
+             }
++            if (!newWard) {
++                showEditAlert('warning', 'Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။');
++                const firstWard = editForm
++                    ? editForm.querySelector('input[name="editWardOrVg"]')
++                    : null;
++                if (firstWard) firstWard.focus();
++                return;
++            }
+ 
+             const originalButtonHtml = editSaveBtn ? editSaveBtn.innerHTML : '';
+             if (editSaveBtn) {
+@@ -1802,7 +2059,12 @@
+                             'Accept': 'application/json',
+                             'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                         },
+-                        body: new URLSearchParams({ qv: newQv, villageName: newName })
++                        body: new URLSearchParams({
++                            qv: newQv,
++                            villageName: newName,
++                            wardOrVg: newWard,
++                            villageCode: newCode
++                        })
+                     }
+                 );
+ 
+@@ -1840,7 +2102,7 @@
+     if (editVillageName) editVillageName.addEventListener('input', clearEditAlert);
+     if (editQv) editQv.addEventListener('change', clearEditAlert);
+ 
+-    if (openImportBtn) openImportBtn.addEventListener('click', openImportModal);
++    setupEntryTabs();
+ 
+     if (importDistrict) {
+         importDistrict.addEventListener('change', async function () {
+diff --git a/templates/townshipVillages.html b/templates/townshipVillages.html
+index 3831ec4..07399f3 100644
+--- a/templates/townshipVillages.html
++++ b/templates/townshipVillages.html
+@@ -165,6 +165,64 @@
+     .panel-head h6 i { color: #10b981; }
+     .panel-body { padding: 15px; }
+ 
++    /* ================= ENTRY CARD / TABS ================= */
++    .entry-card { margin-bottom: 16px; }
++    .entry-tabs {
++        display: flex; align-items: stretch; gap: 4px;
++        padding: 8px 12px 0;
++        border-bottom: 1px solid #eef2f0;
++        background: linear-gradient(180deg, #f7fdfa 0%, #ffffff 100%);
++        border-radius: 14px 14px 0 0;
++    }
++    .entry-tab {
++        position: relative; border: 0; background: transparent;
++        padding: 9px 16px 11px;
++        display: inline-flex; align-items: center; gap: 6px;
++        font-size: 0.76rem; font-weight: 800; color: #64748b;
++        cursor: pointer; border-radius: 9px 9px 0 0;
++        transition: background-color 0.15s ease, color 0.15s ease;
++    }
++    .entry-tab i { color: #10b981; }
++    .entry-tab:hover { background: #f1fbf6; color: #047857; }
++    .entry-tab.active { background: #ecfdf5; color: #047857; }
++    .entry-tab.active::after {
++        content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px;
++        height: 2px; border-radius: 2px; background: #10b981;
++    }
++    .entry-pane { display: none; padding: 16px; }
++    .entry-pane.active { display: block; }
++    .entry-form-grid {
++        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
++        gap: 14px 18px;
++    }
++    .entry-row {
++        grid-column: 1 / -1;
++        display: grid; gap: 14px 18px;
++    }
++    .entry-row.location-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++    .entry-row.location-row.four-location { grid-template-columns: repeat(4, minmax(0, 1fr)); }
++    .entry-form-grid .form-select:disabled {
++        background-color: #f1f5f3; color: #64748b; border-color: #e8eeeb;
++        cursor: not-allowed; opacity: 1;
++    }
++    .entry-form-grid .field-stack { margin-bottom: 0 !important; }
++    .name-field { min-width: 0; }
++    .entry-form-grid .village-alert,
++    .entry-form-grid .import-result,
++    .entry-form-grid .excel-guide { grid-column: 1 / -1; }
++    .entry-form-grid .village-alert,
++    .entry-form-grid .import-result { margin-top: 0; }
++    .entry-form-grid .excel-guide { margin-top: 0; padding-top: 12px; }
++    .entry-form-grid .btn-add-village {
++        grid-column: 1 / -1; width: auto; max-width: 280px; margin-top: 0;
++    }
++    .entry-actions {
++        grid-column: 1 / -1;
++        display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
++    }
++    .entry-actions .btn-import-excel,
++    .entry-actions .btn-sample-excel { flex: 0 0 200px; }
++
+     .count-badge {
+         display: inline-flex; align-items: center; gap: 4px;
+         border-radius: 999px; padding: 3px 9px;
+@@ -235,11 +293,37 @@
+     }
+     .id-note i { color: #0ea5e9; margin-top: 1px; flex-shrink: 0; }
+ 
+-    /* ================= EXCEL IMPORT ================= */
+-    .excel-actions {
+-        display: flex; flex-wrap: wrap; gap: 8px;
+-        margin-top: 10px;
++    /* ================= WARD / VILLAGE CODE FIELDS ================= */
++    .field-stack {
++        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
++        gap: 12px;
++    }
++    .ward-options { display: flex; gap: 8px; }
++    .ward-option { position: relative; flex: 1 1 0; min-width: 0; cursor: pointer; }
++    .ward-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
++    .ward-option span {
++        display: flex; align-items: center; justify-content: center; gap: 5px;
++        min-height: 40px; padding: 7px 10px; border-radius: 9px;
++        border: 1px solid #dfe8e4; background: #ffffff; color: #475569;
++        font-size: 0.78rem; font-weight: 700; line-height: 1.2;
++        transition: background-color 0.15s ease, border-color 0.15s ease,
++                    color 0.15s ease, box-shadow 0.15s ease;
++    }
++    .ward-option input:checked + span {
++        background: #ecfdf5; border-color: #6ee7b7; color: #047857;
++        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.12);
++    }
++    .ward-option input:focus-visible + span {
++        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
++    }
++    .optional-tag {
++        display: inline-flex; align-items: center;
++        background: #f1f5f3; color: #64748b;
++        border-radius: 999px; padding: 1px 6px;
++        font-size: 0.58rem; font-weight: 700; white-space: nowrap;
+     }
++
++    /* ================= EXCEL IMPORT ================= */
+     .btn-import-excel {
+         flex: 1 1 150px; border: 1px solid #bfe8d5; border-radius: 9px; min-height: 38px;
+         padding: 7px 12px;
+@@ -344,6 +428,27 @@
+         line-height: 1.45;
+     }
+     .qv-name i { color: #10b981; font-size: 0.7rem; flex-shrink: 0; }
++    .village-code {
++        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++        font-size: 0.73rem; font-weight: 600; color: #334155;
++        overflow-wrap: anywhere;
++    }
++    .village-code.is-empty { color: #94a3b8; font-weight: 500; }
++    .ward-pill {
++        display: inline-flex; align-items: center;
++        border-radius: 999px; padding: 3px 9px;
++        background: #ecfdf5; border: 1px solid #a7f3d0;
++        color: #047857; font-size: 0.65rem; font-weight: 800;
++        white-space: nowrap;
++    }
++    .ward-pill.is-empty { background: #f1f5f3; border-color: #e2e8f0; color: #94a3b8; }
++
++    .success-modal-icon {
++        width: 58px; height: 58px; border-radius: 50%;
++        display: inline-flex; align-items: center; justify-content: center;
++        background: #ecfdf5; border: 1px solid #a7f3d0;
++        color: #047857; font-size: 1.65rem;
++    }
+ 
+     .table-state { text-align: center; padding: 34px 16px !important; }
+     .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+@@ -432,6 +537,11 @@
+         .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+         .filter-grid .filter-actions { grid-column: 1 / -1; justify-content: flex-end; }
+     }
++    @media (max-width: 991.98px) {
++        .entry-form-grid { grid-template-columns: 1fr; }
++        .entry-row.location-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++        .entry-row.location-row.four-location { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++    }
+     @media (max-width: 575.98px) {
+         .village-hero { padding: 15px; }
+         .hero-main { gap: 10px; }
+@@ -447,6 +557,11 @@
+         .btn-filter-submit, .btn-filter-reset { min-width: 0; width: 100%; }
+         .filter-head-text .filter-sub { display: none; }
+         .panel-body { padding: 13px; }
++        .field-stack { grid-template-columns: 1fr; }
++        .entry-row.location-row { grid-template-columns: 1fr; }
++        .entry-row.location-row.four-location { grid-template-columns: 1fr; }
++        .entry-actions .btn-import-excel,
++        .entry-actions .btn-sample-excel { flex: 1 1 100%; }
+     }
+ </style>
+ {% endblock %}
+@@ -490,6 +605,178 @@
+     </div>
+     {% endif %}
+ 
++    <div class="panel-card entry-card">
++        <div class="entry-tabs" role="tablist" aria-label="ကျေးရွာထည့်သွင်းနည်းများ">
++            <button type="button" class="entry-tab active" id="tabManualEntry"
++                    data-entry-target="paneManualEntry" role="tab"
++                    aria-selected="true" aria-controls="paneManualEntry">
++                <i class="bi bi-pencil-square"></i> ကိုယ်တိုင်ထည့်သွင်းမည်
++            </button>
++            <button type="button" class="entry-tab" id="tabExcelImport"
++                    data-entry-target="paneExcelImport" role="tab"
++                    aria-selected="false" aria-controls="paneExcelImport">
++                <i class="bi bi-file-earmark-excel-fill"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
++            </button>
++        </div>
++
++        <div class="entry-pane active" id="paneManualEntry" role="tabpanel" aria-labelledby="tabManualEntry">
++            <div class="add-intro">
++                <i class="bi bi-info-circle-fill"></i>
++                ကျေးရွာအုပ်စု ရွေးချယ်ပါ။ Ward သို့မဟုတ် Vg ကို ရွေးပြီး ကျေးရွာအမည် ဖြည့်ပါ။ ကျေးရွာကုဒ်ကို မသိပါက ဗလာထားနိုင်ပါသည်။
++            </div>
++
++            <form class="add-form entry-form-grid" id="addVillageForm" autocomplete="off">
++                <div class="entry-row location-row four-location">
++                    <div class="mb-0">
++                        <label class="form-label" for="addState"><i class="bi bi-geo-alt-fill"></i>တိုင်းဒေသကြီး/ပြည်နယ်</label>
++                        <select id="addState" class="form-select" disabled>
++                            <option>{{ state_name }}</option>
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="addDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင်</label>
++                        <select id="addDistrict" class="form-select" disabled>
++                            <option>{{ district_name }}</option>
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="addTownship"><i class="bi bi-building-fill"></i>မြို့နယ်</label>
++                        <select id="addTownship" class="form-select" disabled>
++                            <option>{{ township_name }}</option>
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="addQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
++                        <select id="addQv" class="form-select" required>
++                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
++                            {% for item in qvs %}
++                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++                </div>
++
++                <div class="field-stack">
++                    <div>
++                        <label class="form-label"><i class="bi bi-diagram-2-fill"></i>ရပ်ကွက် / ကျေးရွာ <span class="req">*</span></label>
++                        <div class="ward-options" role="radiogroup" aria-label="Ward or Vg">
++                            <label class="ward-option">
++                                <input type="radio" name="wardOrVg" value="Ward" id="addWard">
++                                <span><i class="bi bi-building"></i>ရပ်ကွက်</span>
++                            </label>
++                            <label class="ward-option">
++                                <input type="radio" name="wardOrVg" value="Vg" id="addVg">
++                                <span><i class="bi bi-house"></i>ကျေးရွာ</span>
++                            </label>
++                        </div>
++                    </div>
++                    <div>
++                        <label class="form-label" for="villageCode">
++                            <i class="bi bi-upc-scan"></i>ကျေးရွာကုဒ်
++                            <span class="optional-tag">မသိပါက ဗလာထားနိုင်ပါသည်</span>
++                        </label>
++                        <input type="text" id="villageCode" class="form-control"
++                               maxlength="50" placeholder="ဥပမာ - 219161"
++                               {% if not qvs %}disabled{% endif %}>
++                    </div>
++                </div>
++
++                <div class="name-field">
++                    <label class="form-label" for="villageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
++                    <input type="text" id="villageName" name="villageName" class="form-control"
++                           maxlength="150" placeholder="ဥပမာ - ကန်ရိုးကျေးရွာ" required
++                           {% if not qvs %}disabled{% endif %}>
++                    <div class="name-hint">
++                        <i class="bi bi-translate"></i>
++                        <span>မြန်မာစာ သို့မဟုတ် English ဖြင့် ရေးသားနိုင်ပါသည်။ ကျေးရွာအမည် ထပ်နေပါက စနစ်မှ လက်မခံပါ။</span>
++                    </div>
++                </div>
++
++                <div id="addAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
++
++                <button type="submit" class="btn-add-village" id="btnAddVillage" {% if not qvs %}disabled{% endif %}>
++                    <i class="bi bi-plus-circle"></i>
++                    ကျေးရွာ ထည့်သွင်းမည်
++                </button>
++            </form>
++        </div>
++
++        <div class="entry-pane" id="paneExcelImport" role="tabpanel" aria-labelledby="tabExcelImport">
++            <div class="add-intro">
++                <i class="bi bi-info-circle-fill"></i>
++                Excel ဖိုင်ဖြင့် ကျေးရွာများကို တစ်ကြောင်းချင်း ထည့်စရာမလိုဘဲ တစ်ခါတည်း ထည့်သွင်းနိုင်ပါသည်။ နမူနာဖိုင်ကို ဒေါင်းလုဒ်လုပ်ပြီး ပြင်ဆင်နိုင်ပါသည်။
++            </div>
++
++            <form class="add-form entry-form-grid" id="villageImportForm" autocomplete="off">
++                <div class="entry-row location-row four-location">
++                    <div class="mb-0">
++                        <label class="form-label" for="importState"><i class="bi bi-geo-alt-fill"></i>တိုင်းဒေသကြီး/ပြည်နယ်</label>
++                        <select id="importState" class="form-select" disabled>
++                            <option>{{ state_name }}</option>
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="importDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင်</label>
++                        <select id="importDistrict" class="form-select" disabled>
++                            <option>{{ district_name }}</option>
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="importTownship"><i class="bi bi-building-fill"></i>မြို့နယ်</label>
++                        <select id="importTownship" class="form-select" disabled>
++                            <option>{{ township_name }}</option>
++                        </select>
++                    </div>
++                    <div class="mb-0">
++                        <label class="form-label" for="importQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
++                        <select id="importQv" class="form-select" required>
++                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
++                            {% for item in qvs %}
++                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
++                            {% endfor %}
++                        </select>
++                    </div>
++                </div>
++
++                <div class="mb-0">
++                    <label class="form-label" for="importFile"><i class="bi bi-file-earmark-excel-fill"></i>Excel ဖိုင် (.xlsx) <span class="req">*</span></label>
++                    <input type="file" id="importFile" class="form-control" accept=".xlsx" required {% if not qvs %}disabled{% endif %}>
++                    <div class="name-hint">
++                        <i class="bi bi-info-circle"></i>
++                        <span>ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအောက်တွင် Excel ဖိုင်၏ ကျေးရွာအမည်များကို ထည့်သွင်းပါမည်။</span>
++                    </div>
++                </div>
++
++                <div class="excel-guide">
++                    <div class="excel-guide-title"><i class="bi bi-list-check"></i> Excel ဖိုင် ပြင်ဆင်ပုံ</div>
++                    <ul>
++                        <li>ဖိုင်တွင် စာမျက်နှာ (sheet) တစ်ခုတည်း ပါဝင်ရမည်။</li>
++                        <li><code>villageName</code> နှင့် <code>Ward and Vg</code> ကော်လံများ ပါဝင်ရမည်။ <code>Ward/Village_ Pcode</code> ကော်လံကို မထည့်တော့ဘဲလည်း ရပါသည်။</li>
++                        <li><code>Ward and Vg</code> က အမျိုးအစား (ဥပမာ - <code>Vg</code>)၊ <code>Ward/Village_ Pcode</code> က ကုဒ် (ဥပမာ - <code>219161</code>) ဖြစ်ပါသည်။</li>
++                        <li><code>No.</code> က အစဉ်နံပါတ်သာ ဖြစ်ပြီး မထည့်လည်းရပါသည်။ villageID ကို စနစ်မှ အလိုအလျောက် သတ်မှတ်ပါသည်။</li>
++                        <li>ကော်လံ ၄ ခုအထိ လက်ခံပါသည်။ မူရင်း ၁ သို့မဟုတ် ၂ ကော်လံ (<code>No.</code>, <code>villageName</code>) ဖိုင်ဟောင်းများကိုလည်း ဆက်လက် လက်ခံပါသည်။</li>
++                        <li>ကျေးရွာအမည်နှင့် Ward and Vg ကော်လံများတွင် ဗလာ မထားရပါ။ Ward and Vg တွင် <code>Ward</code> သို့မဟုတ် <code>Vg</code> သာ ထည့်ပါ။</li>
++                        <li><code>Ward/Village_ Pcode</code> ကုဒ်ကို မသိပါက ဗလာထားနိုင်ပါသည်။ ကျေးရွာအသစ်ထည့်သည့်အခါလည်း ဗလာထားနိုင်ပါသည်။</li>
++                        <li>ကျေးရွာအုပ်စုအတွင်း ရှိပြီးသား ကျေးရွာအမည် သို့မဟုတ် Pcode များကို ကျော်လွှားမည်။</li>
++                        <li>ပထမတန်းသည် ကော်လံခေါင်းစဉ် ဖြစ်ရမည်။</li>
++                    </ul>
++                </div>
++
++                <div id="importAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
++                <div id="importResult" class="import-result d-none" aria-live="polite"></div>
++
++                <div class="entry-actions">
++                    <a class="btn-sample-excel" href="/api/township/villages/sample-excel">
++                        <i class="bi bi-download"></i> နမူနာ Excel ဖိုင်
++                    </a>
++                    <button type="submit" class="btn-import-excel" id="btnImportVillages">
++                        <i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
++                    </button>
++                </div>
++            </form>
++        </div>
++    </div>
++
+     <form method="GET" action="/township/villages" id="villageFilterForm">
+         <div class="filter-card mb-3">
+             <div class="filter-card-head">
+@@ -542,106 +829,46 @@
+         </div>
+     </form>
+ 
+-    <div class="row g-3">
+-        <div class="col-xl-4 col-lg-5">
+-            <div class="panel-card">
+-                <div class="panel-head">
+-                    <h6><span class="add-card-accent"><i class="bi bi-plus-lg"></i></span> ကျေးရွာအသစ် ထည့်သွင်းရန်</h6>
+-                </div>
+-                <div class="panel-body">
+-                    <div class="add-intro">
+-                        <i class="bi bi-info-circle-fill"></i>
+-                        ကျေးရွာအသစ် ထည့်သွင်းရန် ကျေးရွာအုပ်စု ရွေးချယ်ပြီး ကျေးရွာအမည်ကို ဖြည့်ပါ။
+-                    </div>
+-
+-                    <form class="add-form" id="addVillageForm" autocomplete="off">
+-                        <div class="mb-3">
+-                            <label class="form-label" for="addQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
+-                            <select id="addQv" class="form-select" required>
+-                                <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
+-                                {% for item in qvs %}
+-                                <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
+-                                {% endfor %}
+-                            </select>
+-                        </div>
+-
+-                        <div class="mb-0">
+-                            <label class="form-label" for="villageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
+-                            <input type="text" id="villageName" name="villageName" class="form-control"
+-                                   maxlength="150" placeholder="ဥပမာ - ကန်ရိုးကျေးရွာ" required
+-                                   {% if not qvs %}disabled{% endif %}>
+-                            <div class="name-hint">
+-                                <i class="bi bi-translate"></i>
+-                                <span>မြန်မာစာ သို့မဟုတ် English ဖြင့် ရေးသားနိုင်ပါသည်။ ကျေးရွာအမည် ထပ်နေပါက စနစ်မှ လက်မခံပါ။</span>
++    <div class="panel-card list-card">
++        <div class="panel-head">
++            <h6>
++                <i class="bi bi-table"></i>
++                ကျေးရွာစာရင်း
++                <span class="count-badge" id="listCountBadge">{{ filtered_total }} ရွာ</span>
++            </h6>
++            <button type="button" class="btn-icon" id="refreshBtn" title="ပြန်လည်ရယူရန်">
++                <i class="bi bi-arrow-clockwise"></i>
++            </button>
++        </div>
++        <div class="table-responsive">
++            <table class="village-table">
++                <thead>
++                    <tr>
++                        <th>စဉ်</th>
++                        <th>ကျေးရွာအမည်</th>
++                        <th>ကျေးရွာကုဒ်</th>
++                        <th>Ward/Vg</th>
++                        <th>ကျေးရွာအုပ်စု</th>
++                        <th class="text-center">လုပ်ဆောင်ချက်များ</th>
++                    </tr>
++                </thead>
++                <tbody id="villageTbody">
++                    <tr>
++                        <td colspan="6" class="table-state">
++                            <div class="empty-state">
++                                <div class="empty-icon"><i class="bi bi-house"></i></div>
++                                <div class="empty-title">ကျေးရွာစာရင်း ဖွင့်နေသည်…</div>
+                             </div>
+-                        </div>
+-
+-                        <div id="addAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
+-
+-                        <button type="submit" class="btn-add-village" id="btnAddVillage" {% if not qvs %}disabled{% endif %}>
+-                            <i class="bi bi-plus-circle"></i>
+-                            ကျေးရွာ ထည့်သွင်းမည်
+-                        </button>
+-                    </form>
+-
+-                    <div class="id-note">
+-                        <!-- <i class="bi bi-upc-scan"></i> -->
+-                        <span></span>
+-                    </div>
+-
+-                    <div class="excel-actions">
+-                        <button type="button" class="btn-import-excel" id="btnOpenImportExcel" {% if not qvs %}disabled{% endif %}>
+-                            <i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
+-                        </button>
+-                        <a class="btn-sample-excel" href="/api/township/villages/sample-excel">
+-                            <i class="bi bi-download"></i> နမူနာ Excel ဖိုင်
+-                        </a>
+-                    </div>
+-                </div>
+-            </div>
++                        </td>
++                    </tr>
++                </tbody>
++            </table>
+         </div>
+-
+-        <div class="col-xl-8 col-lg-7">
+-            <div class="panel-card list-card">
+-                <div class="panel-head">
+-                    <h6>
+-                        <i class="bi bi-table"></i>
+-                        ကျေးရွာစာရင်း
+-                        <span class="count-badge" id="listCountBadge">{{ filtered_total }} ရွာ</span>
+-                    </h6>
+-                    <button type="button" class="btn-icon" id="refreshBtn" title="ပြန်လည်ရယူရန်">
+-                        <i class="bi bi-arrow-clockwise"></i>
+-                    </button>
+-                </div>
+-                <div class="table-responsive">
+-                    <table class="village-table">
+-                        <thead>
+-                            <tr>
+-                                <th>စဉ်</th>
+-                                <th>ကျေးရွာအမည်</th>
+-                                <th>ကျေးရွာအုပ်စု</th>
+-                                <th class="text-center">လုပ်ဆောင်ချက်များ</th>
+-                            </tr>
+-                        </thead>
+-                        <tbody id="villageTbody">
+-                            <tr>
+-                                <td colspan="4" class="table-state">
+-                                    <div class="empty-state">
+-                                        <div class="empty-icon"><i class="bi bi-house"></i></div>
+-                                        <div class="empty-title">ကျေးရွာစာရင်း ဖွင့်နေသည်…</div>
+-                                    </div>
+-                                </td>
+-                            </tr>
+-                        </tbody>
+-                    </table>
+-                </div>
+-                <div class="panel-foot d-none" id="villagePager">
+-                    <span class="pager-info" id="pagerStatus"></span>
+-                    <nav class="village-pager" aria-label="ကျေးရွာစာရင်း စာမျက်နှာ">
+-                        <ul class="pagination pagination-sm mb-0" id="pagerList"></ul>
+-                    </nav>
+-                </div>
+-            </div>
++        <div class="panel-foot d-none" id="villagePager">
++            <span class="pager-info" id="pagerStatus"></span>
++            <nav class="village-pager" aria-label="ကျေးရွာစာရင်း စာမျက်နှာ">
++                <ul class="pagination pagination-sm mb-0" id="pagerList"></ul>
++            </nav>
+         </div>
+     </div>
+ </div>
+@@ -665,6 +892,29 @@
+                             {% endfor %}
+                         </select>
+                     </div>
++                    <div class="field-stack mb-3">
++                        <div>
++                            <label class="form-label"><i class="bi bi-diagram-2-fill"></i>Ward / Vg <span class="req">*</span></label>
++                            <div class="ward-options" role="radiogroup" aria-label="Ward or Vg">
++                                <label class="ward-option">
++                                    <input type="radio" name="editWardOrVg" value="Ward" id="editWard">
++                                    <span><i class="bi bi-building"></i>Ward</span>
++                                </label>
++                                <label class="ward-option">
++                                    <input type="radio" name="editWardOrVg" value="Vg" id="editVg">
++                                    <span><i class="bi bi-house"></i>Vg</span>
++                                </label>
++                            </div>
++                        </div>
++                        <div>
++                            <label class="form-label" for="editVillageCode">
++                                <i class="bi bi-upc-scan"></i>ကျေးရွာကုဒ်
++                                <span class="optional-tag">မသိပါက ဗလာထားနိုင်ပါသည်</span>
++                            </label>
++                            <input type="text" id="editVillageCode" class="form-control" maxlength="50"
++                                   placeholder="ဥပမာ - 219161">
++                        </div>
++                    </div>
+                     <div class="mb-0">
+                         <label class="form-label" for="editVillageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
+                         <input type="text" id="editVillageName" class="form-control" maxlength="150" required>
+@@ -707,61 +957,19 @@
+     </div>
+ </div>
+ 
+-<div class="modal fade" id="villageImportModal" tabindex="-1" aria-labelledby="villageImportModalLabel" aria-hidden="true">
+-    <div class="modal-dialog modal-dialog-centered">
+-        <div class="modal-content">
+-            <form id="villageImportForm" autocomplete="off">
+-                <div class="modal-header">
+-                    <h5 class="modal-title" id="villageImportModalLabel">
+-                        <i class="bi bi-file-earmark-excel-fill me-2"></i>Excel ဖိုင်ဖြင့် ကျေးရွာ ထည့်သွင်းရန်
+-                    </h5>
+-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="ပိတ်မည်"></button>
+-                </div>
+-                <div class="modal-body">
+-                    <div class="mb-3">
+-                        <label class="form-label" for="importQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
+-                        <select id="importQv" class="form-select" required>
+-                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
+-                            {% for item in qvs %}
+-                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
+-                            {% endfor %}
+-                        </select>
+-                    </div>
+-                    <div class="mb-0">
+-                        <label class="form-label" for="importFile"><i class="bi bi-file-earmark-excel-fill"></i>Excel ဖိုင် (.xlsx) <span class="req">*</span></label>
+-                        <input type="file" id="importFile" class="form-control" accept=".xlsx" required {% if not qvs %}disabled{% endif %}>
+-                        <div class="name-hint">
+-                            <i class="bi bi-info-circle"></i>
+-                            <span>ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအောက်တွင် Excel ဖိုင်၏ ကျေးရွာအမည်များကို ထည့်သွင်းပါမည်။</span>
+-                        </div>
+-                    </div>
+-
+-                    <div class="excel-guide">
+-                        <div class="excel-guide-title"><i class="bi bi-list-check"></i> Excel ဖိုင် ပြင်ဆင်ပုံ</div>
+-                        <ul>
+-                            <li>ဖိုင်တွင် စာမျက်နှာ (sheet) တစ်ခုတည်း ပါဝင်ရမည်။</li>
+-                            <li>ကော်လံ နှစ်ခုထက် မပိုရပါ။ ကော်လံ တစ်ခု (<code>villageName</code>) သို့မဟုတ် ကော်လံ နှစ်ခု (<code>No.</code> နှင့် <code>villageName</code>) ပါဝင်နိုင်သည်။</li>
+-                            <li>ကော်လံ နှစ်ခုဖြစ်ပါက ပထမကော်လံမှာ <code>No.</code> (ကျေးရွာ အရေအတွက်) ဖြစ်ရမည်။</li>
+-                            <li>ဒုတိယကော်လံမှာ <code>villageName</code> အတိအကျ ဖြစ်ရမည်။</li>
+-                            <li>ကျေးရွာအမည် ကော်လံတွင် ဗလာ မထားရပါ။</li>
+-                            <li>ကျေးရွာအုပ်စုအတွင်း ရှိပြီးသား ကျေးရွာအမည်များကို ကျော်လွှားမည်။</li>
+-                            <li>ပထမတန်းသည် ကော်လံခေါင်းစဉ် ဖြစ်ရမည်။</li>
+-                        </ul>
+-                    </div>
+-
+-                    <div id="importAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
+-                    <div id="importResult" class="import-result d-none" aria-live="polite"></div>
+-                </div>
+-                <div class="modal-footer">
+-                    <a class="btn btn-light border me-auto" href="/api/township/villages/sample-excel">
+-                        <i class="bi bi-download"></i> နမူနာဖိုင်
+-                    </a>
+-                    <button type="button" class="btn btn-light border" data-bs-dismiss="modal">မလုပ်တော့ပါ</button>
+-                    <button type="submit" class="btn btn-success" id="btnImportVillages">
+-                        <i class="bi bi-upload"></i> ထည့်သွင်းမည်
+-                    </button>
+-                </div>
+-            </form>
++<div class="modal fade" id="villageDeleteSuccessModal" tabindex="-1" aria-labelledby="villageDeleteSuccessModalLabel" aria-hidden="true">
++    <div class="modal-dialog modal-dialog-centered modal-sm">
++        <div class="modal-content text-center">
++            <div class="modal-body p-4">
++                <div class="success-modal-icon"><i class="bi bi-check-circle-fill"></i></div>
++                <h5 class="modal-title mt-3 mb-2" id="villageDeleteSuccessModalLabel">ကျေးရွာ ဖျက်ပြီးပါပြီ</h5>
++                <p class="mb-0 text-muted" id="deleteSuccessMessage"></p>
++            </div>
++            <div class="modal-footer border-0 justify-content-center pb-3">
++                <button type="button" class="btn btn-success" data-bs-dismiss="modal">
++                    <i class="bi bi-check2"></i> နားလည်ပါသည်
++                </button>
++            </div>
+         </div>
+     </div>
+ </div>
+@@ -788,6 +996,7 @@
+     const addForm = document.getElementById('addVillageForm');
+     const addQv = document.getElementById('addQv');
+     const nameInput = document.getElementById('villageName');
++    const villageCodeInput = document.getElementById('villageCode');
+     const addAlert = document.getElementById('addAlert');
+     const addBtn = document.getElementById('btnAddVillage');
+     const tbody = document.getElementById('villageTbody');
+@@ -801,20 +1010,23 @@
+     const editForm = document.getElementById('villageEditForm');
+     const editQv = document.getElementById('editQv');
+     const editVillageName = document.getElementById('editVillageName');
++    const editVillageCode = document.getElementById('editVillageCode');
+     const editAlert = document.getElementById('editAlert');
+     const editSaveBtn = document.getElementById('btnSaveVillageEdit');
+     const deleteModalEl = document.getElementById('villageDeleteModal');
+     const deleteNameEl = document.getElementById('deleteVillageName');
+     const deleteAlert = document.getElementById('deleteAlert');
+     const deleteConfirmBtn = document.getElementById('btnConfirmDeleteVillage');
+-    const importModalEl = document.getElementById('villageImportModal');
++    const deleteSuccessModalEl = document.getElementById('villageDeleteSuccessModal');
++    const deleteSuccessMessage = document.getElementById('deleteSuccessMessage');
++    const entryTabs = Array.from(document.querySelectorAll('.entry-tab'));
++    const excelEntryTab = document.getElementById('tabExcelImport');
+     const importForm = document.getElementById('villageImportForm');
+     const importQv = document.getElementById('importQv');
+     const importFile = document.getElementById('importFile');
+     const importAlert = document.getElementById('importAlert');
+     const importResult = document.getElementById('importResult');
+     const importBtn = document.getElementById('btnImportVillages');
+-    const openImportBtn = document.getElementById('btnOpenImportExcel');
+ 
+     let totalVillages = Number(dataEl.dataset.totalVillages || 0);
+     let totalFiltered = Number(dataEl.dataset.filteredTotal || 0);
+@@ -834,11 +1046,64 @@
+ 
+     const ADD_BUTTON_HTML = '<i class="bi bi-plus-circle"></i> ကျေးရွာ ထည့်သွင်းမည်';
+     const ADD_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ထည့်သွင်းနေသည်…';
+-    const IMPORT_BUTTON_HTML = '<i class="bi bi-upload"></i> ထည့်သွင်းမည်';
++    const IMPORT_BUTTON_HTML = '<i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်';
+     const IMPORT_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ထည့်သွင်းနေသည်…';
+     const DELETE_BUTTON_HTML = '<i class="bi bi-trash"></i> ဖျက်မည်';
+     const DELETE_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ဖျက်နေသည်…';
+ 
++    function selectedWard(form, name) {
++        const checked = form && form.querySelector(
++            'input[name="' + name + '"]:checked'
++        );
++        return checked ? checked.value : '';
++    }
++
++    function setWard(form, name, value) {
++        if (!form) return;
++        form.querySelectorAll('input[name="' + name + '"]').forEach(function (radio) {
++            radio.checked = radio.value === String(value || '');
++        });
++    }
++
++    function setupEntryTabs() {
++        entryTabs.forEach(function (tab) {
++            tab.addEventListener('click', function () {
++                const targetId = tab.dataset.entryTarget;
++                entryTabs.forEach(function (other) {
++                    const isActive = other === tab;
++                    other.classList.toggle('active', isActive);
++                    other.setAttribute('aria-selected', isActive ? 'true' : 'false');
++                });
++                document.querySelectorAll('.entry-pane').forEach(function (pane) {
++                    pane.classList.toggle('active', pane.id === targetId);
++                });
++                if (tab === excelEntryTab) prepareImportForm();
++            });
++        });
++    }
++
++    function showDeleteSuccess(message) {
++        if (deleteSuccessMessage) {
++            deleteSuccessMessage.textContent = message
++                || 'ကျေးရွာကို အောင်မြင်စွာ ဖျက်ပြီးပါပြီ။';
++        }
++        if (!deleteSuccessModalEl || !window.bootstrap) return;
++
++        const showModal = function () {
++            window.bootstrap.Modal.getOrCreateInstance(deleteSuccessModalEl).show();
++        };
++        // Wait for the confirmation dialog to finish closing before showing
++        // the success dialog, so the two backdrops do not overlap.
++        const deleteModal = deleteModalEl
++            ? window.bootstrap.Modal.getInstance(deleteModalEl)
++            : null;
++        if (deleteModal) {
++            deleteModalEl.addEventListener('hidden.bs.modal', showModal, { once: true });
++        } else {
++            showModal();
++        }
++    }
++
+     function updateTotal(value) {
+         totalVillages = Math.max(0, Number(value) || 0);
+         if (heroTotal) heroTotal.textContent = totalVillages.toLocaleString();
+@@ -852,7 +1117,7 @@
+     function tableStateRow(iconClass, title, text, extraClass) {
+         const tr = document.createElement('tr');
+         const td = document.createElement('td');
+-        td.colSpan = 4;
++        td.colSpan = 6;
+         td.className = 'table-state ' + (extraClass || '');
+ 
+         const wrap = document.createElement('div');
+@@ -933,6 +1198,18 @@
+             nameSpan.textContent = row.villageName || '—';
+             nameTd.appendChild(nameSpan);
+ 
++            const codeTd = document.createElement('td');
++            const codeSpan = document.createElement('span');
++            codeSpan.className = 'village-code' + (row.villageCode ? '' : ' is-empty');
++            codeSpan.textContent = row.villageCode || '—';
++            codeTd.appendChild(codeSpan);
++
++            const wardTd = document.createElement('td');
++            const wardPill = document.createElement('span');
++            wardPill.className = 'ward-pill' + (row.wardOrVg ? '' : ' is-empty');
++            wardPill.textContent = row.wardOrVg || '—';
++            wardTd.appendChild(wardPill);
++
+             const qvTd = document.createElement('td');
+             const qvSpan = document.createElement('span');
+             qvSpan.className = 'qv-name';
+@@ -969,6 +1246,8 @@
+ 
+             tr.appendChild(noTd);
+             tr.appendChild(nameTd);
++            tr.appendChild(codeTd);
++            tr.appendChild(wardTd);
+             tr.appendChild(qvTd);
+             tr.appendChild(actionTd);
+             fragment.appendChild(tr);
+@@ -1202,17 +1481,9 @@
+         importResult.classList.remove('d-none');
+     }
+ 
+-    function openImportModal() {
+-        clearImportAlert();
+-        clearImportResult();
+-        if (importFile) importFile.value = '';
+-        if (importQv) {
+-            const preferred = (addQv && addQv.value) || activeQv || '';
+-            if (preferred) importQv.value = preferred;
+-        }
+-        if (importModalEl && window.bootstrap) {
+-            window.bootstrap.Modal.getOrCreateInstance(importModalEl).show();
+-        }
++    function prepareImportForm() {
++        const preferred = (addQv && addQv.value) || activeQv || '';
++        if (importQv && preferred) importQv.value = preferred;
+     }
+ 
+     function clearEditAlert() {
+@@ -1243,6 +1514,8 @@
+         editingVillage = row || null;
+         if (editQv) editQv.value = row.QVID || '';
+         if (editVillageName) editVillageName.value = row.villageName || '';
++        if (editVillageCode) editVillageCode.value = row.villageCode || '';
++        setWard(editForm, 'editWardOrVg', row.wardOrVg);
+         clearEditAlert();
+ 
+         if (editModalEl && window.bootstrap) {
+@@ -1319,7 +1592,7 @@
+             }
+ 
+             pendingDelete = null;
+-            showAddAlert('success', payload.message || 'ကျေးရွာကို ဖျက်ပြီးပါပြီ။');
++            showDeleteSuccess(payload.message || 'ကျေးရွာကို အောင်မြင်စွာ ဖျက်ပြီးပါပြီ။');
+             updateTotal(Math.max(0, totalVillages - 1));
+             await loadVillages(activeQv, currentPage, true);
+         } catch (err) {
+@@ -1368,6 +1641,8 @@
+ 
+             const qv = addQv ? addQv.value : '';
+             const name = nameInput ? nameInput.value.trim() : '';
++            const ward = selectedWard(addForm, 'wardOrVg');
++            const code = villageCodeInput ? villageCodeInput.value.trim() : '';
+ 
+             if (!qv) {
+                 showAddAlert('warning', 'ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။');
+@@ -1379,8 +1654,17 @@
+                 if (nameInput) nameInput.focus();
+                 return;
+             }
++            if (!ward) {
++                showAddAlert('warning', 'Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။');
++                const firstWard = addForm
++                    ? addForm.querySelector('input[name="wardOrVg"]')
++                    : null;
++                if (firstWard) firstWard.focus();
++                return;
++            }
+ 
+             if (nameInput) nameInput.disabled = true;
++            if (villageCodeInput) villageCodeInput.disabled = true;
+             if (addQv) addQv.disabled = true;
+             setAddBusy(true);
+ 
+@@ -1392,7 +1676,12 @@
+                         'Accept': 'application/json',
+                         'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                     },
+-                    body: new URLSearchParams({ qv: qv, villageName: name })
++                    body: new URLSearchParams({
++                        qv: qv,
++                        villageName: name,
++                        wardOrVg: ward,
++                        villageCode: code
++                    })
+                 });
+ 
+                 let payload = {};
+@@ -1411,6 +1700,7 @@
+                 updateTotal(totalVillages + 1);
+ 
+                 if (nameInput) nameInput.value = '';
++                if (villageCodeInput) villageCodeInput.value = '';
+                 if (addQv) addQv.value = created.QVID || qv;
+                 if (filterQv) filterQv.value = created.QVID || qv;
+ 
+@@ -1420,6 +1710,7 @@
+                 showAddAlert('danger', err && err.message ? err.message : 'ကျေးရွာ ထည့်သွင်းမရပါ။');
+             } finally {
+                 if (nameInput) nameInput.disabled = false;
++                if (villageCodeInput) villageCodeInput.disabled = false;
+                 if (addQv) addQv.disabled = false;
+                 setAddBusy(false);
+             }
+@@ -1434,6 +1725,8 @@
+ 
+             const newQv = editQv ? editQv.value : '';
+             const newName = editVillageName ? editVillageName.value.trim() : '';
++            const newWard = selectedWard(editForm, 'editWardOrVg');
++            const newCode = editVillageCode ? editVillageCode.value.trim() : '';
+ 
+             if (!newQv) {
+                 showEditAlert('warning', 'ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။');
+@@ -1445,6 +1738,14 @@
+                 if (editVillageName) editVillageName.focus();
+                 return;
+             }
++            if (!newWard) {
++                showEditAlert('warning', 'Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။');
++                const firstWard = editForm
++                    ? editForm.querySelector('input[name="editWardOrVg"]')
++                    : null;
++                if (firstWard) firstWard.focus();
++                return;
++            }
+ 
+             const originalButtonHtml = editSaveBtn ? editSaveBtn.innerHTML : '';
+             if (editSaveBtn) {
+@@ -1462,7 +1763,12 @@
+                             'Accept': 'application/json',
+                             'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                         },
+-                        body: new URLSearchParams({ qv: newQv, villageName: newName })
++                        body: new URLSearchParams({
++                            qv: newQv,
++                            villageName: newName,
++                            wardOrVg: newWard,
++                            villageCode: newCode
++                        })
+                     }
+                 );
+ 
+@@ -1496,7 +1802,7 @@
+     if (editVillageName) editVillageName.addEventListener('input', clearEditAlert);
+     if (editQv) editQv.addEventListener('change', clearEditAlert);
+ 
+-    if (openImportBtn) openImportBtn.addEventListener('click', openImportModal);
++    setupEntryTabs();
+     if (importQv) importQv.addEventListener('change', clearImportAlert);
+     if (importFile) {
+         importFile.addEventListener('change', function () {
+diff --git a/tests/test_livestock_ages.py b/tests/test_livestock_ages.py
+new file mode 100644
+index 0000000..96dcbc4
+--- /dev/null
++++ b/tests/test_livestock_ages.py
+@@ -0,0 +1,54 @@
++import unittest
++from unittest.mock import patch
++
++from sqlalchemy import create_engine, text
++from sqlalchemy.pool import StaticPool
++
++from app.database import SQLAlchemyConnection
++from app.lookups import _get_all_livestock_ages
++
++
++class LivestockAgeLookupTests(unittest.TestCase):
++    def setUp(self):
++        self.engine = create_engine(
++            "sqlite://",
++            connect_args={"check_same_thread": False},
++            poolclass=StaticPool,
++        )
++        with self.engine.begin() as connection:
++            connection.execute(text(
++                "CREATE TABLE agetype ("
++                "ageID TEXT, ageName TEXT, animalTypeID TEXT, animalID TEXT)"
++            ))
++            connection.execute(text(
++                "INSERT INTO agetype VALUES "
++                "('ageID01', '(၃) နှစ်အထက်', 'atID01', ''), "
++                "('ageID07', 'ငယ်', 'atID03', 'lsID01'), "
++                "('ageID08', 'လတ်', 'atID03', 'lsID01'), "
++                "('ageID17', 'ကြီး', 'lsID07', 'atID03')"
++            ))
++
++        self.patch = patch(
++            "app.lookups.get_db_connection",
++            side_effect=lambda: SQLAlchemyConnection(self.engine.connect()),
++        )
++        self.patch.start()
++
++    def tearDown(self):
++        self.patch.stop()
++        self.engine.dispose()
++
++    def test_livestock_age_rows_are_returned_and_normalized(self):
++        rows = _get_all_livestock_ages()
++        self.assertEqual(
++            rows,
++            [
++                {"ageID": "ageID07", "ageName": "ငယ်", "animalID": "lsID01"},
++                {"ageID": "ageID08", "ageName": "လတ်", "animalID": "lsID01"},
++                {"ageID": "ageID17", "ageName": "ကြီး", "animalID": "lsID07"},
++            ],
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_temporary_village.py b/tests/test_temporary_village.py
+index b812ddc..be30a9b 100644
+--- a/tests/test_temporary_village.py
++++ b/tests/test_temporary_village.py
+@@ -56,7 +56,8 @@ class TemporaryVillageTests(unittest.TestCase):
+             connection.execute(text(
+                 "CREATE TABLE village ("
+                 "stateID TEXT, districtID TEXT, townshipID TEXT, "
+-                "QVID TEXT, villageID TEXT, villageName TEXT)"
++                "QVID TEXT, villageID TEXT, villageName TEXT, "
++                "villageCode TEXT, wardOrVg TEXT)"
+             ))
+ 
+             connection.execute(text(
+@@ -85,7 +86,8 @@ class TemporaryVillageTests(unittest.TestCase):
+             ))
+             connection.execute(text(
+                 "INSERT INTO village VALUES "
+-                "('s1', 'd1', 't1', 'q1', 'v001', 'Existing Village')"
++                "('s1', 'd1', 't1', 'q1', 'v001', 'Existing Village', "
++                "'219001', 'Vg')"
+             ))
+ 
+         app = FastAPI()
+@@ -143,6 +145,13 @@ class TemporaryVillageTests(unittest.TestCase):
+             )).fetchall()
+         return [tuple(row) for row in rows]
+ 
++    def village_fields(self, village_id):
++        with self.engine.connect() as connection:
++            row = connection.execute(text(
++                "SELECT villageCode, wardOrVg FROM village WHERE villageID = :vid"
++            ), {"vid": village_id}).fetchone()
++        return tuple(row) if row else None
++
+     # ------------------------------------------------------------------
+     # Page / access control
+     # ------------------------------------------------------------------
+@@ -157,6 +166,15 @@ class TemporaryVillageTests(unittest.TestCase):
+         self.assertIn('id="filterTownship"', response.text)
+         self.assertIn('id="addDistrict"', response.text)
+         self.assertIn('id="importDistrict"', response.text)
++        self.assertIn('id="villageCode"', response.text)
++        self.assertIn('name="wardOrVg"', response.text)
++        self.assertIn('id="tabManualEntry"', response.text)
++        self.assertIn('id="tabExcelImport"', response.text)
++        self.assertIn('id="paneManualEntry"', response.text)
++        self.assertIn('id="paneExcelImport"', response.text)
++        self.assertIn('id="villageImportForm"', response.text)
++        self.assertNotIn('id="villageImportModal"', response.text)
++        self.assertIn('id="villageDeleteSuccessModal"', response.text)
+ 
+         self.client.cookies.clear()
+         self.sign_in(role="state")
+@@ -171,6 +189,23 @@ class TemporaryVillageTests(unittest.TestCase):
+         )
+         self.assertEqual(response.status_code, 303)
+ 
++    def test_township_village_page_has_disabled_location_fields_and_burmese_tabs(self):
++        self.sign_in()
++        response = self.client.get("/township/villages")
++        self.assertEqual(response.status_code, 200)
++        self.assertIn("ကိုယ်တိုင်ထည့်သွင်းမည်", response.text)
++        self.assertIn("Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်", response.text)
++        self.assertNotIn("Manual Entry", response.text)
++        self.assertNotIn("Excel File Import", response.text)
++        for field_id in (
++            "addState", "addDistrict", "addTownship",
++            "importState", "importDistrict", "importTownship",
++        ):
++            self.assertIn(
++                'id="' + field_id + '" class="form-select" disabled',
++                response.text,
++            )
++
+     def test_page_works_without_account_district_and_township(self):
+         self.sign_in(district=None, township=None)
+         response = self.client.get("/township/temporary-village")
+@@ -247,6 +282,14 @@ class TemporaryVillageTests(unittest.TestCase):
+             all_rows.json()["villages"][0]["villageName"],
+             "Existing Village",
+         )
++        self.assertEqual(
++            all_rows.json()["villages"][0]["villageCode"],
++            "219001",
++        )
++        self.assertEqual(
++            all_rows.json()["villages"][0]["wardOrVg"],
++            "Vg",
++        )
+ 
+         empty = self.client.get(
+             "/api/township/temporary-villages?district=d1&township=t1&qv=q2"
+@@ -282,6 +325,8 @@ class TemporaryVillageTests(unittest.TestCase):
+                 "township": "t1",
+                 "qv": "q4",
+                 "villageName": "New Village",
++                "wardOrVg": "Ward",
++                "villageCode": "220001",
+             },
+         )
+         self.assertEqual(response.status_code, 200, response.text)
+@@ -289,6 +334,9 @@ class TemporaryVillageTests(unittest.TestCase):
+             response.json()["village"]["districtID"], "d2"
+         )
+         self.assertEqual(response.json()["village"]["townshipID"], "t1")
++        self.assertEqual(response.json()["village"]["wardOrVg"], "Ward")
++        self.assertEqual(response.json()["village"]["villageCode"], "220001")
++        self.assertEqual(self.village_fields("v002"), ("220001", "Ward"))
+ 
+         rows = self.village_rows()
+         self.assertIn(
+@@ -305,6 +353,7 @@ class TemporaryVillageTests(unittest.TestCase):
+                 "township": "t9",
+                 "qv": "q9",
+                 "villageName": "Other State Village",
++                "wardOrVg": "Vg",
+             },
+         )
+         self.assertEqual(response.status_code, 400)
+@@ -321,6 +370,7 @@ class TemporaryVillageTests(unittest.TestCase):
+                 "township": "t1",
+                 "qv": "q1",
+                 "villageName": "existing village",
++                "wardOrVg": "Vg",
+             },
+         )
+         self.assertEqual(response.status_code, 409)
+@@ -334,10 +384,41 @@ class TemporaryVillageTests(unittest.TestCase):
+                 "township": "t1",
+                 "qv": "q2",
+                 "villageName": "Existing Village",
++                "wardOrVg": "Vg",
+             },
+         )
+         self.assertEqual(response.status_code, 200, response.text)
+ 
++    def test_create_requires_ward_or_vg(self):
++        self.sign_in()
++        response = self.client.post(
++            "/api/township/temporary-villages",
++            data={
++                "district": "d1",
++                "township": "t1",
++                "qv": "q1",
++                "villageName": "No Ward Village",
++            },
++        )
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("Ward", response.json()["detail"])
++
++    def test_create_rejects_duplicate_code_in_same_qv(self):
++        self.sign_in()
++        response = self.client.post(
++            "/api/township/temporary-villages",
++            data={
++                "district": "d1",
++                "township": "t1",
++                "qv": "q1",
++                "villageName": "Another Village",
++                "wardOrVg": "Ward",
++                "villageCode": "219001",
++            },
++        )
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(len(self.village_rows()), 1)
++
+     # ------------------------------------------------------------------
+     # Update / delete API
+     # ------------------------------------------------------------------
+@@ -346,13 +427,21 @@ class TemporaryVillageTests(unittest.TestCase):
+ 
+         update = self.client.put(
+             "/api/township/temporary-villages/d1/t1/q1/v001",
+-            data={"qv": "q1", "villageName": "Updated Village"},
++            data={
++                "qv": "q1",
++                "villageName": "Updated Village",
++                "wardOrVg": "Ward",
++                "villageCode": "219999",
++            },
+         )
+         self.assertEqual(update.status_code, 200, update.text)
+         self.assertIn(
+             ("s1", "d1", "t1", "q1", "v001", "Updated Village"),
+             self.village_rows(),
+         )
++        self.assertEqual(update.json()["village"]["wardOrVg"], "Ward")
++        self.assertEqual(update.json()["village"]["villageCode"], "219999")
++        self.assertEqual(self.village_fields("v001"), ("219999", "Ward"))
+ 
+         delete = self.client.delete(
+             "/api/township/temporary-villages/d1/t1/q1/v001"
+@@ -364,10 +453,24 @@ class TemporaryVillageTests(unittest.TestCase):
+         self.sign_in()
+         response = self.client.put(
+             "/api/township/temporary-villages/d9/t9/q9/v001",
+-            data={"qv": "q9", "villageName": "Hijacked"},
++            data={"qv": "q9", "villageName": "Hijacked", "wardOrVg": "Vg"},
+         )
+         self.assertEqual(response.status_code, 400)
+ 
++    def test_update_allows_blank_village_code(self):
++        self.sign_in()
++        update = self.client.put(
++            "/api/township/temporary-villages/d1/t1/q1/v001",
++            data={
++                "qv": "q1",
++                "villageName": "Existing Village",
++                "wardOrVg": "Vg",
++                "villageCode": "",
++            },
++        )
++        self.assertEqual(update.status_code, 200, update.text)
++        self.assertEqual(self.village_fields("v001"), (None, "Vg"))
++
+     # ------------------------------------------------------------------
+     # Excel template / import
+     # ------------------------------------------------------------------
+@@ -381,8 +484,14 @@ class TemporaryVillageTests(unittest.TestCase):
+         workbook = load_workbook(BytesIO(response.content))
+         self.assertEqual(workbook.sheetnames, ["Villages"])
+         rows = list(workbook.active.iter_rows(values_only=True))
+-        self.assertEqual(rows[0], ("No.", "villageName"))
++        self.assertEqual(
++            rows[0],
++            ("No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"),
++        )
+         self.assertEqual(len(rows), 4)
++        self.assertEqual(rows[1][1], "Vg")
++        self.assertEqual(rows[2][1], "Ward")
++        self.assertIsNone(rows[3][2])
+ 
+     def test_sample_excel_guard(self):
+         self.sign_in(role="union")
+@@ -396,10 +505,10 @@ class TemporaryVillageTests(unittest.TestCase):
+     def test_import_uses_chosen_location_and_reports_skipped_rows(self):
+         self.sign_in()
+         content = _workbook_bytes([
+-            ["No.", "villageName"],
+-            [1, "Imported One"],
+-            [2, ""],
+-            [3, "Imported Two"],
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
++            [1, "Vg", "220101", "Imported One"],
++            [2, "Vg", "", ""],
++            [3, "Ward", None, "Imported Two"],
+         ])
+ 
+         response = self.client.post(
+@@ -425,6 +534,87 @@ class TemporaryVillageTests(unittest.TestCase):
+         rows = self.village_rows()
+         self.assertIn(("s1", "d1", "t2", "q3", "v002", "Imported One"), rows)
+         self.assertIn(("s1", "d1", "t2", "q3", "v003", "Imported Two"), rows)
++        self.assertEqual(self.village_fields("v002"), ("220101", "Vg"))
++        self.assertEqual(self.village_fields("v003"), (None, "Ward"))
++
++    def test_import_requires_ward_when_ward_column_is_present(self):
++        self.sign_in()
++        content = _workbook_bytes([
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
++            [1, "", "220201", "Missing Ward"],
++            [2, "Unknown", "220202", "Bad Ward"],
++        ])
++
++        response = self.client.post(
++            "/api/township/temporary-villages/import-excel",
++            data={"district": "d1", "township": "t1", "qv": "q2"},
++            files={
++                "file": (
++                    "villages.xlsx",
++                    content,
++                    "application/vnd.openxmlformats-officedocument."
++                    "spreadsheetml.sheet",
++                ),
++            },
++        )
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["inserted"], 0)
++        self.assertEqual(payload["skipped"], 2)
++        self.assertEqual(len(self.village_rows()), 1)
++
++    def test_import_accepts_legacy_two_column_workbook(self):
++        self.sign_in()
++        content = _workbook_bytes([
++            ["No.", "villageName"],
++            [1, "Legacy Village"],
++        ])
++
++        response = self.client.post(
++            "/api/township/temporary-villages/import-excel",
++            data={"district": "d1", "township": "t1", "qv": "q2"},
++            files={
++                "file": (
++                    "villages.xlsx",
++                    content,
++                    "application/vnd.openxmlformats-officedocument."
++                    "spreadsheetml.sheet",
++                ),
++            },
++        )
++
++        self.assertEqual(response.status_code, 200, response.text)
++        self.assertEqual(response.json()["inserted"], 1)
++        self.assertEqual(self.village_fields("v002"), (None, "Vg"))
++
++    def test_import_accepts_ward_without_code_column(self):
++        self.sign_in()
++        content = _workbook_bytes([
++            ["Ward and Vg", "villageName"],
++            ["Vg", "No Code Village"],
++            ["Ward", "Ward Village"],
++        ])
++
++        response = self.client.post(
++            "/api/township/temporary-villages/import-excel",
++            data={"district": "d1", "township": "t1", "qv": "q2"},
++            files={
++                "file": (
++                    "villages.xlsx",
++                    content,
++                    "application/vnd.openxmlformats-officedocument."
++                    "spreadsheetml.sheet",
++                ),
++            },
++        )
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["inserted"], 2)
++        self.assertEqual(payload["skipped"], 0)
++        self.assertEqual(self.village_fields("v002"), (None, "Vg"))
++        self.assertEqual(self.village_fields("v003"), (None, "Ward"))
+ 
+     def test_import_rejects_location_outside_account_state(self):
+         self.sign_in()
+diff --git a/tests/test_village_import.py b/tests/test_village_import.py
+index 431035e..b4c0689 100644
+--- a/tests/test_village_import.py
++++ b/tests/test_village_import.py
+@@ -45,14 +45,16 @@ class VillageImportTests(unittest.TestCase):
+             connection.execute(text(
+                 "CREATE TABLE village ("
+                 "stateID TEXT, districtID TEXT, townshipID TEXT, "
+-                "QVID TEXT, villageID TEXT, villageName TEXT)"
++                "QVID TEXT, villageID TEXT, villageName TEXT, "
++                "villageCode TEXT, wardOrVg TEXT)"
+             ))
+             connection.execute(text(
+                 "INSERT INTO qv VALUES ('s', 'd1', 't1', 'q1', 'QV One')"
+             ))
+             connection.execute(text(
+                 "INSERT INTO village VALUES "
+-                "('s', 'd1', 't1', 'q1', 'v001', 'Existing Village')"
++                "('s', 'd1', 't1', 'q1', 'v001', 'Existing Village', "
++                "'219001', 'Vg')"
+             ))
+ 
+         app = FastAPI()
+@@ -124,6 +126,13 @@ class VillageImportTests(unittest.TestCase):
+             )).fetchall()
+         return [tuple(row) for row in rows]
+ 
++    def village_fields(self, village_id):
++        with self.engine.connect() as connection:
++            row = connection.execute(text(
++                "SELECT villageCode, wardOrVg FROM village WHERE villageID = :vid"
++            ), {"vid": village_id}).fetchone()
++        return tuple(row) if row else None
++
+     # ------------------------------------------------------------------
+     # Sample workbook
+     # ------------------------------------------------------------------
+@@ -136,10 +145,15 @@ class VillageImportTests(unittest.TestCase):
+         self.assertEqual(workbook.sheetnames, ["Villages"])
+         sheet = workbook.active
+         rows = list(sheet.iter_rows(values_only=True))
+-        self.assertEqual(rows[0], ("No.", "villageName"))
++        self.assertEqual(
++            rows[0],
++            ("No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"),
++        )
+         self.assertEqual(len(rows), 4)
+         self.assertEqual([row[0] for row in rows[1:]], [1, 2, 3])
+-        self.assertTrue(all(row[1] for row in rows[1:]))
++        self.assertEqual([row[1] for row in rows[1:]], ["Vg", "Ward", "Vg"])
++        self.assertEqual([row[2] for row in rows[1:]], [219161, 219162, None])
++        self.assertTrue(all(row[3] for row in rows[1:]))
+ 
+     def test_sample_excel_guard(self):
+         self.sign_in(role="state")
+@@ -159,11 +173,11 @@ class VillageImportTests(unittest.TestCase):
+     def test_import_inserts_rows_with_account_scope_and_skips_invalid(self):
+         self.sign_in()
+         content = _workbook_bytes([
+-            ["No.", "villageName"],
+-            [1, "New Village A"],
+-            [2, ""],
+-            [3, "existing village"],
+-            [4, "New Village B"],
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
++            [1, "Vg", "220101", "New Village A"],
++            [2, "Vg", "220102", ""],
++            [3, "Vg", "220103", "existing village"],
++            [4, "Ward", None, "New Village B"],
+         ])
+ 
+         response = self.import_file(content)
+@@ -180,6 +194,8 @@ class VillageImportTests(unittest.TestCase):
+         self.assertEqual(rows[0], ("s", "d1", "t1", "q1", "Existing Village"))
+         self.assertEqual(rows[1], ("s", "d1", "t1", "q1", "New Village A"))
+         self.assertEqual(rows[2], ("s", "d1", "t1", "q1", "New Village B"))
++        self.assertEqual(self.village_fields("v002"), ("220101", "Vg"))
++        self.assertEqual(self.village_fields("v003"), (None, "Ward"))
+ 
+     def test_import_accepts_village_name_only_and_detects_in_file_duplicates(self):
+         self.sign_in()
+@@ -195,6 +211,61 @@ class VillageImportTests(unittest.TestCase):
+         payload = response.json()
+         self.assertEqual(payload["inserted"], 1)
+         self.assertEqual(payload["skipped"], 1)
++        self.assertEqual(self.village_fields("v002"), (None, "Vg"))
++
++    def test_import_accepts_ward_without_code_column(self):
++        self.sign_in()
++        content = _workbook_bytes([
++            ["No.", "Ward and Vg", "villageName"],
++            [1, "Vg", "No Code Village"],
++            [2, "Ward", "Ward Village"],
++        ])
++
++        response = self.import_file(content)
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["inserted"], 2)
++        self.assertEqual(payload["skipped"], 0)
++        self.assertEqual(self.village_fields("v002"), (None, "Vg"))
++        self.assertEqual(self.village_fields("v003"), (None, "Ward"))
++
++    def test_import_skips_rows_with_missing_or_invalid_ward(self):
++        self.sign_in()
++        content = _workbook_bytes([
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
++            [1, "", "220201", "Missing Ward"],
++            [2, "Unknown", "220202", "Bad Ward"],
++            [3, "Vg", "220203", "Valid Village"],
++        ])
++
++        response = self.import_file(content)
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["inserted"], 1)
++        self.assertEqual(payload["skipped"], 2)
++        reasons = [item["reason"] for item in payload["errors"]]
++        self.assertTrue(any("ဗလာ" in reason for reason in reasons))
++        self.assertTrue(any("Ward" in reason or "Vg" in reason for reason in reasons))
++        self.assertEqual(self.village_fields("v002"), ("220203", "Vg"))
++
++    def test_import_skips_duplicate_village_code(self):
++        self.sign_in()
++        content = _workbook_bytes([
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
++            [1, "Vg", "219001", "Different Name Same Code"],
++            [2, "Vg", "220401", "Valid Village"],
++        ])
++
++        response = self.import_file(content)
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["inserted"], 1)
++        self.assertEqual(payload["skipped"], 1)
++        self.assertIn("Pcode", payload["errors"][0]["reason"])
++        self.assertEqual(self.village_fields("v002"), ("220401", "Vg"))
+ 
+     # ------------------------------------------------------------------
+     # Validation failures
+@@ -207,32 +278,42 @@ class VillageImportTests(unittest.TestCase):
+         self.assertEqual(response.status_code, 400)
+         self.assertIn("sheet", response.json()["detail"])
+ 
+-    def test_import_rejects_more_than_two_columns(self):
++    def test_import_rejects_more_than_four_columns(self):
+         self.sign_in()
+         response = self.import_file(_workbook_bytes([
+-            ["No.", "villageName", "Extra"],
+-            [1, "Village", "x"],
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName", "Extra"],
++            [1, "Vg", "220301", "Village", "x"],
+         ]))
+         self.assertEqual(response.status_code, 400)
++        self.assertIn("လေးခု", response.json()["detail"])
+ 
+     def test_import_requires_exact_village_name_column(self):
+         self.sign_in()
+         response = self.import_file(_workbook_bytes([
+-            ["No.", "village_name"],
+-            [1, "Village"],
++            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "village_name"],
++            [1, "Vg", "220302", "Village"],
+         ]))
+         self.assertEqual(response.status_code, 400)
+         self.assertIn("villageName", response.json()["detail"])
+ 
+-    def test_import_requires_no_as_the_first_column(self):
++    def test_import_requires_ward_and_code_headers_for_three_column_files(self):
++        self.sign_in()
++        response = self.import_file(_workbook_bytes([
++            ["Ward and Vg", "villageName", "Extra"],
++            ["Vg", "Village", "x"],
++        ]))
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("ကော်လံခေါင်းစဉ်", response.json()["detail"])
++
++    def test_import_accepts_no_in_any_order_but_requires_known_headers(self):
+         self.sign_in()
+ 
+         inverted = self.import_file(_workbook_bytes([
+             ["villageName", "No."],
+             ["Village", 1],
+         ]))
+-        self.assertEqual(inverted.status_code, 400)
+-        self.assertIn("No.", inverted.json()["detail"])
++        self.assertEqual(inverted.status_code, 200, inverted.text)
++        self.assertEqual(inverted.json()["inserted"], 1)
+ 
+         wrong_label = self.import_file(_workbook_bytes([
+             ["Number", "villageName"],
