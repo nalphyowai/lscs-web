@@ -48,9 +48,38 @@
                 </div>
             </div>
             <div class="table-responsive custom-scrollbar">
+                <style>
+                    .poultry-desc-row td {
+                        background: #f0fdf4;
+                        border-color: #b9dfca !important;
+                        color: #23533b;
+                        font-size: .75rem;
+                        vertical-align: top;
+                        padding: .4rem .5rem;
+                    }
+                    .poultry-age-desc-label { font-weight: 700; margin-right: .35rem; }
+                    .poultry-age-desc-cell { line-height: 1.5; }
+                    .poultry-age-desc-value { white-space: nowrap; }
+                    .poultry-age-desc-empty { color: #6b7280; font-style: italic; }
+                </style>
                 <script>
                     const livestockAnimalData = {{ livestockAni | tojson | safe }};
+                    const livestockAgeData = {{ livestockAges | default([]) | tojson | safe }};
                     const animalOptions = livestockAnimalData.map(la => `<option value="${la.animalID}">${la.animalName}</option>`).join('');
+
+                    const livestockAgesByAnimal = {};
+                    livestockAgeData.forEach(item => {
+                        const animalID = String(item.animalID || '').trim();
+                        if (!animalID) return;
+                        if (!livestockAgesByAnimal[animalID]) livestockAgesByAnimal[animalID] = [];
+                        livestockAgesByAnimal[animalID].push({
+                            ageID: String(item.ageID || '').trim(),
+                            ageName: String(item.ageName || '').trim()
+                        });
+                    });
+                    Object.values(livestockAgesByAnimal).forEach(list => {
+                        list.sort((a, b) => a.ageID.localeCompare(b.ageID));
+                    });
                 </script>
                 <table class="table-bordered-custom mb-0" id="poultryTable" style="min-width: 900px;">
                     <thead>
@@ -131,7 +160,7 @@
         }
         if (hp.value === 'yes') {
             let hasData = false;
-            document.querySelectorAll('#poultryBody tr').forEach(row => {
+            document.querySelectorAll('#poultryBody tr.poultry-data-row').forEach(row => {
                 const sel = row.querySelector('.poultry-type-select');
                 const inp = row.querySelector('input[type="text"]:not(.count-input)');
                 if ((sel && sel.value) || (inp && inp.value.trim())) hasData = true;
@@ -163,6 +192,7 @@ window.addPoultryRow = function (rowData = null) {
     const tbody = document.getElementById('poultryBody');
     const tr = document.createElement('tr');
     tr.id = 'poultryRow_' + currentCount;
+    tr.className = 'poultry-data-row';
     
     tr.innerHTML = `
         <td>
@@ -185,6 +215,13 @@ window.addPoultryRow = function (rowData = null) {
         <td class="text-center"><button type="button" onclick="removeRow('poultryRow_${currentCount}')" class="btn btn-sm text-danger"><i class="bi bi-trash"></i></button></td>
     `;
     tbody.appendChild(tr);
+
+    // Description row is one merged cell across the existing columns; no new column is added.
+    const descTr = document.createElement('tr');
+    descTr.id = 'poultryDescRow_' + currentCount;
+    descTr.className = 'poultry-desc-row';
+    descTr.dataset.descFor = tr.id;
+    tbody.appendChild(descTr);
 
     const breedSelect = tr.querySelector('.poultry-type-select');
     const speciesSelect = tr.querySelector('.poultry-species-select');
@@ -276,8 +313,50 @@ window.togglePoultryAgeColumns = function (sel, rowData = null) {
     });
     
     calculateRowTotal(row);
+    updatePoultryAgeDescription(row);
     if (!rowData) saveFormDataforPart3();
 };
+
+function updatePoultryAgeDescription(row) {
+    const descRow = document.getElementById(
+        row.id.replace('poultryRow_', 'poultryDescRow_')
+    );
+    if (!descRow) return;
+
+    descRow.replaceChildren();
+    const animalID = String(row.querySelector('.poultry-type-select')?.value || '').trim();
+    const records = livestockAgesByAnimal[animalID] || [];
+
+    // One merged cell only: no age columns and no repeated descriptions.
+    const cell = document.createElement('td');
+    cell.colSpan = 10;
+    cell.className = 'poultry-age-desc-cell';
+
+    if (!records.length) {
+        cell.classList.add('poultry-age-desc-empty', 'text-center');
+        cell.textContent = 'တိကျသော အသက်အပိုင်းအခြားမရှိပါ';
+        descRow.appendChild(cell);
+        return;
+    }
+
+    const label = document.createElement('span');
+    label.className = 'poultry-age-desc-label';
+    label.textContent = 'အသက်အပိုင်းအခြား -';
+    cell.appendChild(label);
+
+    let hasValue = false;
+    records.forEach(record => {
+        if (!record.ageName) return;
+        if (hasValue) cell.appendChild(document.createTextNode(' ၊ '));
+        const value = document.createElement('span');
+        value.className = 'poultry-age-desc-value';
+        value.textContent = record.ageName;
+        cell.appendChild(value);
+        hasValue = true;
+    });
+
+    descRow.appendChild(cell);
+}
 
 function calculateRowTotal(row) {
     const total = row.querySelector('.total-input');
@@ -290,7 +369,13 @@ function calculateRowTotal(row) {
 
 window.removeRow = function (rowId) {
     const r = document.getElementById(rowId);
-    if (r) r.remove();
+    if (r) {
+        const desc = document.getElementById(
+            rowId.replace('poultryRow_', 'poultryDescRow_')
+        );
+        if (desc) desc.remove();
+        r.remove();
+    }
     saveFormDataforPart3();
 };
 
@@ -301,7 +386,7 @@ function saveFormDataforPart3 () {
     if (radio) data['has_poultry'] = radio.value;
 
     const poultryRows = [];
-    document.querySelectorAll('#poultryBody tr').forEach(row => {
+    document.querySelectorAll('#poultryBody tr.poultry-data-row').forEach(row => {
         const rowData = {};
         row.querySelectorAll('input, select').forEach(inp => {
             
@@ -371,7 +456,7 @@ function loadFormDataforPart3() {
         }
 
         const records = [];
-        const ani_rows = document.querySelectorAll("#poultryBody tr");
+        const ani_rows = document.querySelectorAll("#poultryBody tr.poultry-data-row");
 
         ani_rows.forEach(row => {
             const animalID = row.querySelector('select[name*="[breed]"]').value;

@@ -125,8 +125,17 @@
                         <input type="text" id="respondentAge" name="age" required inputmode="numeric" class="form-control" style="background:#fff;">
                     </div>
                     <div class="col-6">
-                        <label class="form-label">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
-                        <input type="text" id="respondentEducation" name="eduStatus" required class="form-control" style="background:#fff;">
+                        <label class="form-label" for="respondentEducation">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
+                        <select id="respondentEducation" name="eduStatus" required class="form-select" style="background:#fff;">
+                            <option value="" disabled selected>---- ရွေးချယ်ပါ -----</option>
+                            <option value="ဘက">ဘက</option>
+                            <option value="မူလတန်း">မူလတန်း</option>
+                            <option value="အလယ်တန်း">အလယ်တန်း</option>
+                            <option value="ဘွဲ့ကြို">ဘွဲ့ကြို</option>
+                            <option value="ဘွဲ့ရ">ဘွဲ့ရ</option>
+                            <option value="ဘွဲ့လွန်">ဘွဲ့လွန်</option>
+                            <option value="အခြား">အခြား</option>
+                        </select>
                     </div>
                 </div>
                 <div>
@@ -166,8 +175,17 @@
                         <input type="text" id="headAge" name="headAge" required inputmode="numeric" class="form-control" style="background:#fff;">
                     </div>
                     <div class="col-6">
-                        <label class="form-label">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
-                        <input type="text" id="headEducation" name="headEduStatus" required class="form-control" style="background:#fff;">
+                        <label class="form-label" for="headEducation">ပညာအရည်အချင်း <span class="text-danger">*</span></label>
+                        <select id="headEducation" name="headEduStatus" required class="form-select" style="background:#fff;">
+                            <option value="" disabled selected>---- ရွေးချယ်ပါ -----</option>
+                            <option value="ဘက">ဘက</option>
+                            <option value="မူလတန်း">မူလတန်း</option>
+                            <option value="အလယ်တန်း">အလယ်တန်း</option>
+                            <option value="ဘွဲ့ကြို">ဘွဲ့ကြို</option>
+                            <option value="ဘွဲ့ရ">ဘွဲ့ရ</option>
+                            <option value="ဘွဲ့လွန်">ဘွဲ့လွန်</option>
+                            <option value="အခြား">အခြား</option>
+                        </select>
                     </div>
                 </div>
                 <div>
@@ -294,6 +312,10 @@
     }
 
     #collectionDetails input[readonly] { background: #f0fdf4 !important; border-color: #b9dfca; color: #23533b; }
+    #collectionDetails select.locked-education {
+        background: #f0fdf4 !important; border-color: #b9dfca; color: #23533b;
+        pointer-events: none; opacity: 1;
+    }
     @media (max-width: 575.98px) {
         .household-match { padding: 18px; }
         .household-match-options { grid-template-columns: 1fr; gap: 10px; }
@@ -584,7 +606,16 @@ function setupRespondentHeadSync(form) {
         }
         pairs.forEach(([respondent, head]) => {
             const target = field(head);
-            target.readOnly = same;
+            if (!target) return;
+            if (target.tagName === 'SELECT') {
+                // A select cannot be readOnly. Keep it enabled so its value is
+                // still submitted, but lock the control visually and via focus.
+                target.classList.toggle('locked-education', same);
+                target.setAttribute('aria-disabled', String(same));
+                target.tabIndex = same ? -1 : 0;
+            } else {
+                target.readOnly = same;
+            }
             if (same) {
                 target.value = field(respondent).value;
                 target.classList.remove('error-input');
@@ -600,12 +631,19 @@ function setupRespondentHeadSync(form) {
         wasSame = same;
     }
     form.querySelectorAll('[name="respondent_is_head"]').forEach(radio => radio.addEventListener('change', sync));
-    pairs.forEach(([respondent]) => field(respondent).addEventListener('input', () => {
-        if (respondent === 'age') {
-            field(respondent).value = stripNonDigits(field(respondent).value);
+    pairs.forEach(([respondent]) => {
+        const source = field(respondent);
+        if (!source) return;
+        const handleSourceChange = () => {
+            if (respondent === 'age') source.value = stripNonDigits(source.value);
+            if (isSame()) sync();
+        };
+        if (source.tagName === 'SELECT') {
+            source.addEventListener('change', handleSourceChange);
+        } else {
+            source.addEventListener('input', handleSourceChange);
         }
-        if (isSame()) sync();
-    }));
+    });
     form.querySelectorAll('[name="gender"]').forEach(radio => radio.addEventListener('change', sync));
     headRadios.forEach(radio => {
         radio.addEventListener('click', event => { if (isSame()) event.preventDefault(); });
@@ -823,10 +861,10 @@ document.addEventListener('DOMContentLoaded', async function () {
         const collecting = isCollecting();
         const details = document.getElementById('collectionDetails');
         details.classList.toggle('d-none', !collecting);
-        details.querySelectorAll('input').forEach(input => {
-            input.disabled = !collecting;
-            input.required = collecting;
-            input.classList.remove('error-input');
+        details.querySelectorAll('input, select').forEach(field => {
+            field.disabled = !collecting;
+            field.required = collecting;
+            field.classList.remove('error-input');
         });
         if (nextBtn) nextBtn.innerHTML = collecting
             ? 'နောက်စာမျက်နှာသို့ <i class="bi bi-arrow-right"></i>'

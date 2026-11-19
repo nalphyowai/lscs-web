@@ -24,6 +24,8 @@ logger = logging.getLogger("lbvd")
 router = APIRouter(tags=["villages"])
 
 VILLAGE_NAME_MAX = 150
+VILLAGE_CODE_MAX = 50
+WARD_OR_VG_MAX = 20
 VILLAGE_ID_MAX_RETRIES = 5
 VILLAGE_PAGE_SIZE = 10
 
@@ -108,6 +110,56 @@ def _normalize_village_name(raw: str) -> str:
     return re.sub(r"\s+", " ", name)
 
 
+def _cell_text(value) -> str:
+    """Excel cells may arrive as numbers (e.g. Pcode 219161) or text."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return unicodedata.normalize("NFC", str(value)).strip()
+
+
+def _normalize_header(value) -> str:
+    """Case/space tolerant header key: 'Ward/Village_ Pcode' -> 'ward/village_pcode'."""
+    text = unicodedata.normalize("NFKC", _cell_text(value)).lower()
+    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"\s*([_/])\s*", r"\1", text)
+
+
+# Ward / village-tract classification used by both the manual forms and the
+# Excel importer.  Stored values are always one of these two canonical labels.
+WARD_OPTIONS = ("Ward", "Vg")
+_WARD_ALIASES = {
+    "ward": "Ward",
+    "wards": "Ward",
+    "ရပ်ကွက်": "Ward",
+    "vg": "Vg",
+    "village": "Vg",
+    "villages": "Vg",
+    "ကျေးရွာ": "Vg",
+}
+
+
+def _normalize_ward_or_vg(raw) -> str:
+    """Return 'Ward' or 'Vg'; an empty string means an invalid value."""
+    text = unicodedata.normalize("NFC", _cell_text(raw))
+    return _WARD_ALIASES.get(text.lower(), "")
+
+
+def _normalize_village_code(raw) -> str:
+    """Codes are optional, but are normalised when supplied."""
+    return _cell_text(raw)
+
+
+def _validate_village_code(code: str) -> str:
+    code = _normalize_village_code(code)
+    if len(code) > VILLAGE_CODE_MAX:
+        raise HTTPException(
+            400, f"ကျေးရွာကုဒ်သည် {VILLAGE_CODE_MAX} လုံးထက် မကျော်ရပါ။"
+        )
+    return code
+
+
 def _fetch_qvs(cursor, state_id: str, district_id: str, township_id: str) -> list[dict]:
     cursor.execute(
         "SELECT QVID, QVName FROM qv "
@@ -146,11 +198,30 @@ def _find_duplicate_village(cursor, state_id: str, district_id: str,
     return cursor.fetchone()
 
 
+def _find_duplicate_village_code(cursor, state_id: str, district_id: str,
+                                 township_id: str, qv_id: str, code: str,
+                                 exclude_village_id: str | None = None):
+    """Return a village with the same Pcode inside the same QV."""
+    sql = (
+        "SELECT villageID FROM village "
+        "WHERE stateID = %s AND districtID = %s AND townshipID = %s AND QVID = %s "
+        "AND villageCode = %s"
+    )
+    params = [state_id, district_id, township_id, qv_id, code]
+    if exclude_village_id:
+        sql += " AND villageID <> %s"
+        params.append(exclude_village_id)
+    sql += " LIMIT 1"
+    cursor.execute(sql, tuple(params))
+    return cursor.fetchone()
+
+
 def _fetch_villages(cursor, state_id: str, district_id: str, township_id: str,
                     qv_id: str = "", limit: int | None = None,
                     offset: int = 0) -> list[dict]:
     sql = """
         SELECT v.QVID, v.villageID, v.villageName, v.districtID, v.townshipID,
+               v.villageCode, v.wardOrVg,
                COALESCE(q.QVName, v.QVID) AS QVName
         FROM village v
         LEFT JOIN qv q
@@ -578,12 +649,16 @@ async def api_create_township_village(
     request: Request,
     qv: str = Form(...),
     villageName: str = Form(...),
+    wardOrVg: str = Form(""),
+    villageCode: str = Form(""),
 ):
     user = get_signed_in_user(request)
     state_id, district_id, township_id = _township_scope(user)
 
     qv_id = (qv or "").strip()
     name = _normalize_village_name(villageName)
+    ward = _normalize_ward_or_vg(wardOrVg)
+    code = _validate_village_code(villageCode)
 
     if not qv_id:
         raise HTTPException(400, "ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။")
@@ -591,6 +666,8 @@ async def api_create_township_village(
         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
     if len(name) > VILLAGE_NAME_MAX:
         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
+    if not ward:
+        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
 
     conn = cursor = None
     try:
@@ -611,6 +688,13 @@ async def api_create_township_village(
                 409,
                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
             )
+        if code and _find_duplicate_village_code(
+            cursor, state_id, district_id, township_id, qv_id, code,
+        ):
+            raise HTTPException(
+                409,
+                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+            )
 
         created_id = None
         for attempt in range(VILLAGE_ID_MAX_RETRIES):
@@ -620,9 +704,13 @@ async def api_create_township_village(
                 )
                 cursor.execute(
                     "INSERT INTO village "
-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (state_id, district_id, township_id, qv_id, village_id, name),
+                    "(stateID, districtID, townshipID, QVID, villageID, "
+                    "villageName, villageCode, wardOrVg) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        state_id, district_id, township_id, qv_id, village_id,
+                        name, code or None, ward,
+                    ),
                 )
                 conn.commit()
                 created_id = village_id
@@ -653,6 +741,8 @@ async def api_create_township_village(
                 "QVName": qv_name,
                 "villageID": created_id,
                 "villageName": name,
+                "villageCode": code,
+                "wardOrVg": ward,
             },
         }
     except HTTPException:
@@ -679,6 +769,8 @@ async def api_update_township_village(
     village_id: str,
     qv: str = Form(...),
     villageName: str = Form(...),
+    wardOrVg: str = Form(""),
+    villageCode: str = Form(""),
 ):
     user = get_signed_in_user(request)
     state_id, district_id, township_id = _township_scope(user)
@@ -687,6 +779,8 @@ async def api_update_township_village(
     old_village_id = (village_id or "").strip()
     new_qv_id = (qv or "").strip()
     name = _normalize_village_name(villageName)
+    ward = _normalize_ward_or_vg(wardOrVg)
+    code = _validate_village_code(villageCode)
 
     if not new_qv_id:
         raise HTTPException(400, "ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။")
@@ -694,6 +788,8 @@ async def api_update_township_village(
         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
     if len(name) > VILLAGE_NAME_MAX:
         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
+    if not ward:
+        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
 
     conn = cursor = None
     try:
@@ -724,6 +820,14 @@ async def api_update_township_village(
                 409,
                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
             )
+        if code and _find_duplicate_village_code(
+            cursor, state_id, district_id, township_id, new_qv_id, code,
+            exclude_village_id=old_village_id,
+        ):
+            raise HTTPException(
+                409,
+                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+            )
 
         updated_id = old_village_id
         if moving_qv:
@@ -733,11 +837,12 @@ async def api_update_township_village(
                         cursor, state_id, district_id, township_id, new_qv_id,
                     )
                     cursor.execute(
-                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s "
+                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s, "
+                        "villageCode = %s, wardOrVg = %s "
                         "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
                         "AND QVID = %s AND villageID = %s",
                         (
-                            new_qv_id, updated_id, name,
+                            new_qv_id, updated_id, name, code or None, ward,
                             state_id, district_id, township_id,
                             old_qv_id, old_village_id,
                         ),
@@ -758,11 +863,11 @@ async def api_update_township_village(
                         )
         else:
             cursor.execute(
-                "UPDATE village SET villageName = %s "
+                "UPDATE village SET villageName = %s, villageCode = %s, wardOrVg = %s "
                 "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
                 "AND QVID = %s AND villageID = %s",
                 (
-                    name,
+                    name, code or None, ward,
                     state_id, district_id, township_id,
                     old_qv_id, old_village_id,
                 ),
@@ -783,6 +888,8 @@ async def api_update_township_village(
                 "QVName": qv_name,
                 "villageID": updated_id,
                 "villageName": name,
+                "villageCode": code,
+                "wardOrVg": ward,
             },
         }
     except HTTPException:
@@ -947,6 +1054,8 @@ async def api_create_temporary_village(
     township: str = Form(...),
     qv: str = Form(...),
     villageName: str = Form(...),
+    wardOrVg: str = Form(""),
+    villageCode: str = Form(""),
 ):
     user = get_signed_in_user(request)
     state_id = _township_state(user)
@@ -955,6 +1064,8 @@ async def api_create_temporary_village(
     township_id = (township or "").strip()
     qv_id = (qv or "").strip()
     name = _normalize_village_name(villageName)
+    ward = _normalize_ward_or_vg(wardOrVg)
+    code = _validate_village_code(villageCode)
 
     if not district_id:
         raise HTTPException(400, "ခရိုင် တစ်ခု ရွေးချယ်ပါ။")
@@ -966,6 +1077,8 @@ async def api_create_temporary_village(
         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
     if len(name) > VILLAGE_NAME_MAX:
         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
+    if not ward:
+        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
 
     conn = cursor = None
     try:
@@ -986,6 +1099,13 @@ async def api_create_temporary_village(
                 409,
                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
             )
+        if code and _find_duplicate_village_code(
+            cursor, state_id, district_id, township_id, qv_id, code,
+        ):
+            raise HTTPException(
+                409,
+                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+            )
 
         created_id = None
         for attempt in range(VILLAGE_ID_MAX_RETRIES):
@@ -995,9 +1115,13 @@ async def api_create_temporary_village(
                 )
                 cursor.execute(
                     "INSERT INTO village "
-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (state_id, district_id, township_id, qv_id, village_id, name),
+                    "(stateID, districtID, townshipID, QVID, villageID, "
+                    "villageName, villageCode, wardOrVg) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        state_id, district_id, township_id, qv_id, village_id,
+                        name, code or None, ward,
+                    ),
                 )
                 conn.commit()
                 created_id = village_id
@@ -1033,6 +1157,8 @@ async def api_create_temporary_village(
                 "QVName": qv_name,
                 "villageID": created_id,
                 "villageName": name,
+                "villageCode": code,
+                "wardOrVg": ward,
             },
         }
     except HTTPException:
@@ -1063,6 +1189,8 @@ async def api_update_temporary_village(
     village_id: str,
     qv: str = Form(...),
     villageName: str = Form(...),
+    wardOrVg: str = Form(""),
+    villageCode: str = Form(""),
 ):
     user = get_signed_in_user(request)
     state_id = _township_state(user)
@@ -1073,6 +1201,8 @@ async def api_update_temporary_village(
     old_village_id = (village_id or "").strip()
     new_qv_id = (qv or "").strip()
     name = _normalize_village_name(villageName)
+    ward = _normalize_ward_or_vg(wardOrVg)
+    code = _validate_village_code(villageCode)
 
     if not district_id or not township_id:
         raise HTTPException(400, "ခရိုင် နှင့် မြို့နယ် အချက်အလက် မပြည့်စုံပါ။")
@@ -1082,6 +1212,8 @@ async def api_update_temporary_village(
         raise HTTPException(400, "ကျေးရွာအမည် ထည့်သွင်းပါ။")
     if len(name) > VILLAGE_NAME_MAX:
         raise HTTPException(400, f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။")
+    if not ward:
+        raise HTTPException(400, "Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။")
 
     conn = cursor = None
     try:
@@ -1115,6 +1247,14 @@ async def api_update_temporary_village(
                 409,
                 f"'{name}' သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
             )
+        if code and _find_duplicate_village_code(
+            cursor, state_id, district_id, township_id, new_qv_id, code,
+            exclude_village_id=old_village_id,
+        ):
+            raise HTTPException(
+                409,
+                f"'{code}' ကျေးရွာကုဒ်သည် ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+            )
 
         updated_id = old_village_id
         if moving_qv:
@@ -1124,11 +1264,12 @@ async def api_update_temporary_village(
                         cursor, state_id, district_id, township_id, new_qv_id,
                     )
                     cursor.execute(
-                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s "
+                        "UPDATE village SET QVID = %s, villageID = %s, villageName = %s, "
+                        "villageCode = %s, wardOrVg = %s "
                         "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
                         "AND QVID = %s AND villageID = %s",
                         (
-                            new_qv_id, updated_id, name,
+                            new_qv_id, updated_id, name, code or None, ward,
                             state_id, district_id, township_id,
                             old_qv_id, old_village_id,
                         ),
@@ -1149,11 +1290,11 @@ async def api_update_temporary_village(
                         )
         else:
             cursor.execute(
-                "UPDATE village SET villageName = %s "
+                "UPDATE village SET villageName = %s, villageCode = %s, wardOrVg = %s "
                 "WHERE stateID = %s AND districtID = %s AND townshipID = %s "
                 "AND QVID = %s AND villageID = %s",
                 (
-                    name,
+                    name, code or None, ward,
                     state_id, district_id, township_id,
                     old_qv_id, old_village_id,
                 ),
@@ -1176,6 +1317,8 @@ async def api_update_temporary_village(
                 "QVName": qv_name,
                 "villageID": updated_id,
                 "villageName": name,
+                "villageCode": code,
+                "wardOrVg": ward,
             },
         }
     except HTTPException:
@@ -1274,24 +1417,190 @@ async def api_delete_temporary_village(
 IMPORT_SHEET_TITLE = "Villages"
 IMPORT_HEADER_NAME = "villageName"
 IMPORT_HEADER_NO = "No."
+IMPORT_HEADER_WARD = "Ward and Vg"
+IMPORT_HEADER_CODE = "Ward/Village_ Pcode"
 IMPORT_HEADER_NO_ALIASES = {"no.", "no"}
+IMPORT_HEADER_WARD_ALIASES = {
+    _normalize_header(IMPORT_HEADER_WARD),
+    "ward and village",
+    "ward",
+}
+IMPORT_HEADER_CODE_ALIASES = {
+    _normalize_header(IMPORT_HEADER_CODE),
+    "ward/village pcode",
+    "villagepcode",
+    "villagecode",
+    "pcode",
+}
+
+
+def _parse_import_headers(headers: list[str]) -> tuple[int, int | None, int | None]:
+    """Validate the header row and locate the name/ward/code columns.
+
+    `villageName` is always required.  `Ward and Vg` is required for any new
+    layout, while `Ward/Village_ Pcode` may be omitted entirely.  `No.` is
+    optional and only represents a serial number; villageID is generated.
+
+    Accepted layouts (columns in any order):
+      - villageName                                  (legacy, ward defaults to Vg)
+      - No., villageName                             (legacy, ward defaults to Vg)
+      - Ward and Vg, villageName
+      - No., Ward and Vg, villageName
+      - Ward and Vg, Ward/Village_ Pcode, villageName
+      - No., Ward and Vg, Ward/Village_ Pcode, villageName
+    """
+    if not headers:
+        raise HTTPException(400, "Excel ဖိုင်၏ ပထမတန်းတွင် ကော်လံခေါင်းစဉ် မပါဝင်ပါ။")
+    if len(headers) > 4:
+        raise HTTPException(
+            400,
+            "Excel ဖိုင်တွင် ကော်လံ လေးခုထက် မပိုရပါ။ "
+            "(No., Ward and Vg, Ward/Village_ Pcode, villageName)",
+        )
+
+    keys = [_normalize_header(header) for header in headers]
+    name_key = _normalize_header(IMPORT_HEADER_NAME)
+    if keys.count(name_key) != 1:
+        raise HTTPException(
+            400,
+            "'villageName' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
+        )
+    name_idx = keys.index(name_key)
+
+    def matches(aliases: set[str]) -> list[int]:
+        return [i for i, key in enumerate(keys) if key in aliases]
+
+    ward_matches = matches(IMPORT_HEADER_WARD_ALIASES)
+    code_matches = matches(IMPORT_HEADER_CODE_ALIASES)
+    no_matches = matches(IMPORT_HEADER_NO_ALIASES)
+    duplicate_message = "ကော်လံခေါင်းစဉ်များ ထပ်နေပါသည်။"
+    if len(ward_matches) > 1 or len(code_matches) > 1 or len(no_matches) > 1:
+        raise HTTPException(400, duplicate_message)
+
+    ward_idx = ward_matches[0] if ward_matches else None
+    code_idx = code_matches[0] if code_matches else None
+    known = {name_idx}
+    for idx in (ward_idx, code_idx, *(no_matches or [])):
+        if idx is None:
+            continue
+        if idx in known:
+            raise HTTPException(400, duplicate_message)
+        known.add(idx)
+
+    if len(known) != len(headers):
+        raise HTTPException(
+            400,
+            "မမှန်ကန်သော ကော်လံခေါင်းစဉ် ပါဝင်ပါသည်။ "
+            "(No., Ward and Vg, Ward/Village_ Pcode, villageName)",
+        )
+
+    # The only legacy layouts without a Ward column are the original one- and
+    # two-column files.  Every other file must state Ward explicitly.
+    if ward_idx is None and len(headers) > 2:
+        raise HTTPException(
+            400,
+            "'Ward and Vg' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
+        )
+    if len(headers) == 2 and ward_idx is None and not no_matches:
+        raise HTTPException(
+            400,
+            "ကော်လံ နှစ်ခုရှိပါက 'No.' နှင့် 'villageName' သို့မဟုတ် "
+            "'Ward and Vg' နှင့် 'villageName' ပါဝင်ရပါမည်။",
+        )
+    if len(headers) == 4 and (code_idx is None or not no_matches):
+        raise HTTPException(
+            400,
+            "ကော်လံ လေးခုရှိပါက 'No.', 'Ward and Vg', "
+            "'Ward/Village_ Pcode', 'villageName' တို့ ပါဝင်ရပါမည်။",
+        )
+
+    return name_idx, ward_idx, code_idx
+
+
+def _parse_import_record(row: list, name_idx: int, ward_idx: int | None,
+                         code_idx: int | None, row_number: int):
+    """Return (record, None) or (None, skip-details) for one Excel row."""
+    def cell(index: int | None) -> str:
+        return _cell_text(row[index]) if index is not None and index < len(row) else ""
+
+    raw_name = cell(name_idx)
+    if not raw_name:
+        return None, {
+            "row": row_number,
+            "villageName": "",
+            "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
+        }
+
+    name = _normalize_village_name(raw_name)
+    if not name:
+        return None, {
+            "row": row_number,
+            "villageName": raw_name,
+            "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
+        }
+    if len(name) > VILLAGE_NAME_MAX:
+        return None, {
+            "row": row_number,
+            "villageName": name,
+            "reason": f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် မကျော်ရပါ။",
+        }
+
+    raw_ward = cell(ward_idx)
+    ward = _normalize_ward_or_vg(raw_ward)
+    if ward_idx is not None and not ward:
+        reason = (
+            "'Ward and Vg' ကော်လံ ဗလာဖြစ်နေပါသည်။"
+            if not raw_ward
+            else "'Ward and Vg' ကော်လံတွင် 'Ward' သို့မဟုတ် 'Vg' ထည့်ပါ။"
+        )
+        return None, {
+            "row": row_number,
+            "villageName": name,
+            "reason": reason,
+        }
+    if len(raw_ward) > WARD_OR_VG_MAX:
+        return None, {
+            "row": row_number,
+            "villageName": name,
+            "reason": f"'Ward and Vg' သည် {WARD_OR_VG_MAX} လုံးထက် မကျော်ရပါ။",
+        }
+    # Legacy one/two-column workbooks have no ward column; tag those rows as
+    # village tracts so every stored record still has a Ward/Vg value.
+    if not ward:
+        ward = "Vg"
+
+    code = _normalize_village_code(cell(code_idx))
+    if len(code) > VILLAGE_CODE_MAX:
+        return None, {
+            "row": row_number,
+            "villageName": name,
+            "reason": f"'Ward/Village_ Pcode' သည် {VILLAGE_CODE_MAX} လုံးထက် မကျော်ရပါ။",
+        }
+
+    return {"name": name, "ward": ward, "code": code}, None
 
 
 @router.get("/api/township/villages/sample-excel")
 async def api_download_sample_village_excel(request: Request):
-    """Download the two-column Excel template used by the importer."""
+    """Download the Excel template used by the importer."""
     user = get_signed_in_user(request)
     _township_scope(user)
 
     wb = Workbook()
     ws = wb.active
     ws.title = IMPORT_SHEET_TITLE
-    ws.append([IMPORT_HEADER_NO, IMPORT_HEADER_NAME])
-    ws.append([1, "ကန်ရိုးကျေးရွာ"])
-    ws.append([2, "ဆံပင်ကျေးရွာ"])
-    ws.append([3, "မြို့လယ်ကျေးရွာ"])
+    ws.append([
+        IMPORT_HEADER_NO, IMPORT_HEADER_WARD, IMPORT_HEADER_CODE,
+        IMPORT_HEADER_NAME,
+    ])
+    ws.append([1, "Vg", 219161, "ဆိတ်နံကုန်း"])
+    ws.append([2, "Ward", 219162, "ကန်ရိုးကျေးရွာ"])
+    # The last row shows that an unknown Pcode may be left blank.
+    ws.append([3, "Vg", None, "မြို့လယ်ကျေးရွာ"])
     ws.column_dimensions["A"].width = 8
-    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 24
+    ws.column_dimensions["D"].width = 32
 
     output = BytesIO()
     wb.save(output)
@@ -1308,11 +1617,11 @@ async def api_download_sample_village_excel(request: Request):
 
 @router.post("/api/township/villages/import-excel")
 async def api_import_township_villages_excel(request: Request):
-    """Import villages from a one-sheet, at-most-two-column Excel file.
+    """Import villages from a one-sheet Excel file.
 
     Every inserted row reuses the account's state/district/township and the
-    QV chosen in the upload form.  Rows whose village name is blank, too long
-    or already present inside the same QV are skipped and reported back.
+    QV chosen in the upload form.  Ward/Vg is required and the village code is
+    optional.  Invalid or duplicate rows are skipped and reported back.
     """
     user = get_signed_in_user(request)
     state_id, district_id, township_id = _township_scope(user)
@@ -1367,28 +1676,7 @@ async def api_import_township_villages_excel(request: Request):
         while headers and headers[-1] == "":
             headers.pop()
 
-        if not headers:
-            raise HTTPException(400, "Excel ဖိုင်၏ ပထမတန်းတွင် ကော်လံခေါင်းစဉ် မပါဝင်ပါ။")
-        if len(headers) > 2:
-            raise HTTPException(
-                400,
-                "Excel ဖိုင်တွင် ကော်လံ နှစ်ခုထက် မပိုရပါ။ (No. နှင့် villageName)",
-            )
-        if headers.count(IMPORT_HEADER_NAME) != 1:
-            raise HTTPException(
-                400,
-                "'villageName' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
-            )
-
-        name_idx = headers.index(IMPORT_HEADER_NAME)
-        if len(headers) == 2:
-            first_header = headers[0].strip().lower()
-            if name_idx != 1 or first_header not in IMPORT_HEADER_NO_ALIASES:
-                raise HTTPException(
-                    400,
-                    "ကော်လံ နှစ်ခုရှိပါက ပထမကော်လံမှာ 'No.' နှင့် "
-                    "ဒုတိယကော်လံမှာ 'villageName' ဖြစ်ရပါမည်။",
-                )
+        name_idx, ward_idx, code_idx = _parse_import_headers(headers)
 
         conn = cursor = None
         try:
@@ -1408,33 +1696,16 @@ async def api_import_township_villages_excel(request: Request):
                 ):
                     continue
 
-                raw_name = row[name_idx] if name_idx < len(row) else None
-                if raw_name is None or str(raw_name).strip() == "":
-                    skipped.append({
-                        "row": row_number,
-                        "villageName": "",
-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
-                    })
+                record, skip = _parse_import_record(
+                    row, name_idx, ward_idx, code_idx, row_number,
+                )
+                if skip is not None:
+                    skipped.append(skip)
                     continue
 
-                name = _normalize_village_name(str(raw_name))
-                if not name:
-                    skipped.append({
-                        "row": row_number,
-                        "villageName": str(raw_name),
-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
-                    })
-                    continue
-                if len(name) > VILLAGE_NAME_MAX:
-                    skipped.append({
-                        "row": row_number,
-                        "villageName": name,
-                        "reason": (
-                            f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် "
-                            "မကျော်ရပါ။"
-                        ),
-                    })
-                    continue
+                name = record["name"]
+                ward = record["ward"]
+                code = record["code"]
 
                 if _find_duplicate_village(
                     cursor, state_id, district_id, township_id, qv_id, name,
@@ -1445,15 +1716,28 @@ async def api_import_township_villages_excel(request: Request):
                         "reason": "ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
                     })
                     continue
+                if code and _find_duplicate_village_code(
+                    cursor, state_id, district_id, township_id, qv_id, code,
+                ):
+                    skipped.append({
+                        "row": row_number,
+                        "villageName": name,
+                        "reason": "ဒီ Ward/Village_ Pcode သည် ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+                    })
+                    continue
 
                 village_id = _next_village_id(
                     cursor, state_id, district_id, township_id, qv_id,
                 )
                 cursor.execute(
                     "INSERT INTO village "
-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (state_id, district_id, township_id, qv_id, village_id, name),
+                    "(stateID, districtID, townshipID, QVID, villageID, "
+                    "villageName, villageCode, wardOrVg) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        state_id, district_id, township_id, qv_id, village_id,
+                        name, code or None, ward or None,
+                    ),
                 )
                 inserted += 1
 
@@ -1505,19 +1789,25 @@ async def api_import_township_villages_excel(request: Request):
 # ============================================================
 @router.get("/api/township/temporary-villages/sample-excel")
 async def api_download_temporary_sample_village_excel(request: Request):
-    """Download the same two-column template used by the temporary page."""
+    """Download the same Excel template used by the temporary page."""
     user = get_signed_in_user(request)
     _township_state(user)
 
     wb = Workbook()
     ws = wb.active
     ws.title = IMPORT_SHEET_TITLE
-    ws.append([IMPORT_HEADER_NO, IMPORT_HEADER_NAME])
-    ws.append([1, "ကန်ရိုးကျေးရွာ"])
-    ws.append([2, "ဆံပင်ကျေးရွာ"])
-    ws.append([3, "မြို့လယ်ကျေးရွာ"])
+    ws.append([
+        IMPORT_HEADER_NO, IMPORT_HEADER_WARD, IMPORT_HEADER_CODE,
+        IMPORT_HEADER_NAME,
+    ])
+    ws.append([1, "Vg", 219161, "ဆိတ်နံကုန်း"])
+    ws.append([2, "Ward", 219162, "ကန်ရိုးကျေးရွာ"])
+    # The last row shows that an unknown Pcode may be left blank.
+    ws.append([3, "Vg", None, "မြို့လယ်ကျေးရွာ"])
     ws.column_dimensions["A"].width = 8
-    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 24
+    ws.column_dimensions["D"].width = 32
 
     output = BytesIO()
     wb.save(output)
@@ -1593,28 +1883,7 @@ async def api_import_temporary_villages_excel(request: Request):
         while headers and headers[-1] == "":
             headers.pop()
 
-        if not headers:
-            raise HTTPException(400, "Excel ဖိုင်၏ ပထမတန်းတွင် ကော်လံခေါင်းစဉ် မပါဝင်ပါ။")
-        if len(headers) > 2:
-            raise HTTPException(
-                400,
-                "Excel ဖိုင်တွင် ကော်လံ နှစ်ခုထက် မပိုရပါ။ (No. နှင့် villageName)",
-            )
-        if headers.count(IMPORT_HEADER_NAME) != 1:
-            raise HTTPException(
-                400,
-                "'villageName' ကော်လံ တစ်ခုတည်း အတိအကျ ပါဝင်ရပါမည်။",
-            )
-
-        name_idx = headers.index(IMPORT_HEADER_NAME)
-        if len(headers) == 2:
-            first_header = headers[0].strip().lower()
-            if name_idx != 1 or first_header not in IMPORT_HEADER_NO_ALIASES:
-                raise HTTPException(
-                    400,
-                    "ကော်လံ နှစ်ခုရှိပါက ပထမကော်လံမှာ 'No.' နှင့် "
-                    "ဒုတိယကော်လံမှာ 'villageName' ဖြစ်ရပါမည်။",
-                )
+        name_idx, ward_idx, code_idx = _parse_import_headers(headers)
 
         conn = cursor = None
         try:
@@ -1636,33 +1905,16 @@ async def api_import_temporary_villages_excel(request: Request):
                 ):
                     continue
 
-                raw_name = row[name_idx] if name_idx < len(row) else None
-                if raw_name is None or str(raw_name).strip() == "":
-                    skipped.append({
-                        "row": row_number,
-                        "villageName": "",
-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
-                    })
+                record, skip = _parse_import_record(
+                    row, name_idx, ward_idx, code_idx, row_number,
+                )
+                if skip is not None:
+                    skipped.append(skip)
                     continue
 
-                name = _normalize_village_name(str(raw_name))
-                if not name:
-                    skipped.append({
-                        "row": row_number,
-                        "villageName": str(raw_name),
-                        "reason": "ကျေးရွာအမည် ဗလာဖြစ်နေပါသည်။",
-                    })
-                    continue
-                if len(name) > VILLAGE_NAME_MAX:
-                    skipped.append({
-                        "row": row_number,
-                        "villageName": name,
-                        "reason": (
-                            f"ကျေးရွာအမည်သည် {VILLAGE_NAME_MAX} လုံးထက် "
-                            "မကျော်ရပါ။"
-                        ),
-                    })
-                    continue
+                name = record["name"]
+                ward = record["ward"]
+                code = record["code"]
 
                 if _find_duplicate_village(
                     cursor, state_id, district_id, township_id, qv_id, name,
@@ -1673,15 +1925,28 @@ async def api_import_temporary_villages_excel(request: Request):
                         "reason": "ကျေးရွာအုပ်စုအတွင်း ကျေးရွာစာရင်းတွင် ရှိပြီးဖြစ်ပါသည်။",
                     })
                     continue
+                if code and _find_duplicate_village_code(
+                    cursor, state_id, district_id, township_id, qv_id, code,
+                ):
+                    skipped.append({
+                        "row": row_number,
+                        "villageName": name,
+                        "reason": "ဒီ Ward/Village_ Pcode သည် ကျေးရွာအုပ်စုအတွင်း ရှိပြီးဖြစ်ပါသည်။",
+                    })
+                    continue
 
                 village_id = _next_village_id(
                     cursor, state_id, district_id, township_id, qv_id,
                 )
                 cursor.execute(
                     "INSERT INTO village "
-                    "(stateID, districtID, townshipID, QVID, villageID, villageName) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (state_id, district_id, township_id, qv_id, village_id, name),
+                    "(stateID, districtID, townshipID, QVID, villageID, "
+                    "villageName, villageCode, wardOrVg) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        state_id, district_id, township_id, qv_id, village_id,
+                        name, code or None, ward or None,
+                    ),
                 )
                 inserted += 1
 

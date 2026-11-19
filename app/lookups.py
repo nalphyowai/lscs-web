@@ -161,6 +161,46 @@ def _get_all_livestock_animals():
         return []
 
 
+def _get_all_livestock_ages():
+    """Return agetype rows linked to a livestock (lsID...) animal.
+
+    Older databases contain a few rows where the animalTypeID / animalID
+    values were inserted in the wrong order, so both columns are checked.
+    """
+    try:
+        conn = get_db_connection(); cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                "SELECT ageID, ageName, animalTypeID, animalID FROM agetype "
+                "ORDER BY ageID"
+            )
+            rows = []
+            seen = set()
+            for record in cur.fetchall():
+                animal_id = str(record.get("animalID") or "").strip()
+                if not animal_id.startswith("lsID"):
+                    candidate = str(record.get("animalTypeID") or "").strip()
+                    animal_id = candidate if candidate.startswith("lsID") else ""
+                if not animal_id:
+                    continue
+                age_id = str(record.get("ageID") or "").strip()
+                key = (animal_id, age_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "ageID": age_id,
+                    "ageName": str(record.get("ageName") or "").strip(),
+                    "animalID": animal_id,
+                })
+            return rows
+        finally:
+            cur.close(); conn.close()
+    except SQLAlchemyError as e:
+        logger.warning(f"_get_all_livestock_ages: {e}")
+        return []
+
+
 def _get_all_breeding_animals():
     try:
         conn = get_db_connection(); cur = conn.cursor(dictionary=True)

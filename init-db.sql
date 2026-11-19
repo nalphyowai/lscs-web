@@ -19304,6 +19304,8 @@ CREATE TABLE IF NOT EXISTS `village` (
   `QVID` varchar(30) NOT NULL,
   `villageID` varchar(30) NOT NULL,
   `villageName` text DEFAULT NULL,
+  `villageCode` varchar(50) DEFAULT NULL,
+  `wardOrVg` varchar(20) DEFAULT NULL,
   PRIMARY KEY (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`),
   KEY `villageindex` (`stateID`,`districtID`,`townshipID`,`QVID`,`villageID`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

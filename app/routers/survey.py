@@ -22,6 +22,7 @@ from app.lookups import (
     _get_all_breeding_animals,
     _get_all_large_animals,
     _get_all_livestock_animals,
+    _get_all_livestock_ages,
     _get_all_small_animals,
     _get_all_states,
 )
@@ -441,6 +442,7 @@ async def compat_process_step_3(form_id: str, request: Request):
     return templates.TemplateResponse(request=request, name="FormPart3.html", context={
         "active_page": "survey",
         "livestockAni": _get_all_livestock_animals(),
+        "livestockAges": _get_all_livestock_ages(),
         "form_id": form_id,
         "states": _get_all_states(),
         "user": request.session.get("user"),

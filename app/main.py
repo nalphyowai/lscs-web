@@ -107,6 +107,7 @@ def ensure_personcv_record_uuid():
 
 
 def ensure_village_table():
+    """Create the village table and add the Ward/Vg + code columns if missing."""
     try:
         with engine.begin() as conn:
             conn.exec_driver_sql("""
@@ -117,10 +118,29 @@ def ensure_village_table():
                     QVID VARCHAR(30) NOT NULL,
                     villageID VARCHAR(30) NOT NULL,
                     villageName TEXT DEFAULT NULL,
+                    villageCode VARCHAR(50) DEFAULT NULL,
+                    wardOrVg VARCHAR(20) DEFAULT NULL,
                     PRIMARY KEY (stateID, districtID, townshipID, QVID, villageID),
                     KEY villageindex (stateID, districtID, townshipID, QVID, villageID)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
+            existing = {column["name"] for column in inspect(conn).get_columns("village")}
+            if "villageCode" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE village ADD COLUMN villageCode VARCHAR(50) DEFAULT NULL"
+                )
+                logger.info("village: added villageCode column")
+            if "wardOrVg" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE village ADD COLUMN wardOrVg VARCHAR(20) DEFAULT NULL"
+                )
+                logger.info("village: added wardOrVg column")
+            # Older records predate the Ward/Vg field.  Treat them as village
+            # tracts so every row has a value and the UI can offer a default.
+            conn.exec_driver_sql(
+                "UPDATE village SET wardOrVg = 'Vg' "
+                "WHERE wardOrVg IS NULL OR TRIM(wardOrVg) = ''"
+            )
         logger.info("village table ready")
     except SQLAlchemyError as e:
         logger.warning("ensure_village_table: %s", e)

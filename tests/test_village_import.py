@@ -45,14 +45,16 @@ class VillageImportTests(unittest.TestCase):
             connection.execute(text(
                 "CREATE TABLE village ("
                 "stateID TEXT, districtID TEXT, townshipID TEXT, "
-                "QVID TEXT, villageID TEXT, villageName TEXT)"
+                "QVID TEXT, villageID TEXT, villageName TEXT, "
+                "villageCode TEXT, wardOrVg TEXT)"
             ))
             connection.execute(text(
                 "INSERT INTO qv VALUES ('s', 'd1', 't1', 'q1', 'QV One')"
             ))
             connection.execute(text(
                 "INSERT INTO village VALUES "
-                "('s', 'd1', 't1', 'q1', 'v001', 'Existing Village')"
+                "('s', 'd1', 't1', 'q1', 'v001', 'Existing Village', "
+                "'219001', 'Vg')"
             ))
 
         app = FastAPI()
@@ -124,6 +126,13 @@ class VillageImportTests(unittest.TestCase):
             )).fetchall()
         return [tuple(row) for row in rows]
 
+    def village_fields(self, village_id):
+        with self.engine.connect() as connection:
+            row = connection.execute(text(
+                "SELECT villageCode, wardOrVg FROM village WHERE villageID = :vid"
+            ), {"vid": village_id}).fetchone()
+        return tuple(row) if row else None
+
     # ------------------------------------------------------------------
     # Sample workbook
     # ------------------------------------------------------------------
@@ -136,10 +145,15 @@ class VillageImportTests(unittest.TestCase):
         self.assertEqual(workbook.sheetnames, ["Villages"])
         sheet = workbook.active
         rows = list(sheet.iter_rows(values_only=True))
-        self.assertEqual(rows[0], ("No.", "villageName"))
+        self.assertEqual(
+            rows[0],
+            ("No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"),
+        )
         self.assertEqual(len(rows), 4)
         self.assertEqual([row[0] for row in rows[1:]], [1, 2, 3])
-        self.assertTrue(all(row[1] for row in rows[1:]))
+        self.assertEqual([row[1] for row in rows[1:]], ["Vg", "Ward", "Vg"])
+        self.assertEqual([row[2] for row in rows[1:]], [219161, 219162, None])
+        self.assertTrue(all(row[3] for row in rows[1:]))
 
     def test_sample_excel_guard(self):
         self.sign_in(role="state")
@@ -159,11 +173,11 @@ class VillageImportTests(unittest.TestCase):
     def test_import_inserts_rows_with_account_scope_and_skips_invalid(self):
         self.sign_in()
         content = _workbook_bytes([
-            ["No.", "villageName"],
-            [1, "New Village A"],
-            [2, ""],
-            [3, "existing village"],
-            [4, "New Village B"],
+            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
+            [1, "Vg", "220101", "New Village A"],
+            [2, "Vg", "220102", ""],
+            [3, "Vg", "220103", "existing village"],
+            [4, "Ward", None, "New Village B"],
         ])
 
         response = self.import_file(content)
@@ -180,6 +194,8 @@ class VillageImportTests(unittest.TestCase):
         self.assertEqual(rows[0], ("s", "d1", "t1", "q1", "Existing Village"))
         self.assertEqual(rows[1], ("s", "d1", "t1", "q1", "New Village A"))
         self.assertEqual(rows[2], ("s", "d1", "t1", "q1", "New Village B"))
+        self.assertEqual(self.village_fields("v002"), ("220101", "Vg"))
+        self.assertEqual(self.village_fields("v003"), (None, "Ward"))
 
     def test_import_accepts_village_name_only_and_detects_in_file_duplicates(self):
         self.sign_in()
@@ -195,6 +211,61 @@ class VillageImportTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["inserted"], 1)
         self.assertEqual(payload["skipped"], 1)
+        self.assertEqual(self.village_fields("v002"), (None, "Vg"))
+
+    def test_import_accepts_ward_without_code_column(self):
+        self.sign_in()
+        content = _workbook_bytes([
+            ["No.", "Ward and Vg", "villageName"],
+            [1, "Vg", "No Code Village"],
+            [2, "Ward", "Ward Village"],
+        ])
+
+        response = self.import_file(content)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["inserted"], 2)
+        self.assertEqual(payload["skipped"], 0)
+        self.assertEqual(self.village_fields("v002"), (None, "Vg"))
+        self.assertEqual(self.village_fields("v003"), (None, "Ward"))
+
+    def test_import_skips_rows_with_missing_or_invalid_ward(self):
+        self.sign_in()
+        content = _workbook_bytes([
+            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
+            [1, "", "220201", "Missing Ward"],
+            [2, "Unknown", "220202", "Bad Ward"],
+            [3, "Vg", "220203", "Valid Village"],
+        ])
+
+        response = self.import_file(content)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["inserted"], 1)
+        self.assertEqual(payload["skipped"], 2)
+        reasons = [item["reason"] for item in payload["errors"]]
+        self.assertTrue(any("ဗလာ" in reason for reason in reasons))
+        self.assertTrue(any("Ward" in reason or "Vg" in reason for reason in reasons))
+        self.assertEqual(self.village_fields("v002"), ("220203", "Vg"))
+
+    def test_import_skips_duplicate_village_code(self):
+        self.sign_in()
+        content = _workbook_bytes([
+            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName"],
+            [1, "Vg", "219001", "Different Name Same Code"],
+            [2, "Vg", "220401", "Valid Village"],
+        ])
+
+        response = self.import_file(content)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["inserted"], 1)
+        self.assertEqual(payload["skipped"], 1)
+        self.assertIn("Pcode", payload["errors"][0]["reason"])
+        self.assertEqual(self.village_fields("v002"), ("220401", "Vg"))
 
     # ------------------------------------------------------------------
     # Validation failures
@@ -207,32 +278,42 @@ class VillageImportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("sheet", response.json()["detail"])
 
-    def test_import_rejects_more_than_two_columns(self):
+    def test_import_rejects_more_than_four_columns(self):
         self.sign_in()
         response = self.import_file(_workbook_bytes([
-            ["No.", "villageName", "Extra"],
-            [1, "Village", "x"],
+            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "villageName", "Extra"],
+            [1, "Vg", "220301", "Village", "x"],
         ]))
         self.assertEqual(response.status_code, 400)
+        self.assertIn("လေးခု", response.json()["detail"])
 
     def test_import_requires_exact_village_name_column(self):
         self.sign_in()
         response = self.import_file(_workbook_bytes([
-            ["No.", "village_name"],
-            [1, "Village"],
+            ["No.", "Ward and Vg", "Ward/Village_ Pcode", "village_name"],
+            [1, "Vg", "220302", "Village"],
         ]))
         self.assertEqual(response.status_code, 400)
         self.assertIn("villageName", response.json()["detail"])
 
-    def test_import_requires_no_as_the_first_column(self):
+    def test_import_requires_ward_and_code_headers_for_three_column_files(self):
+        self.sign_in()
+        response = self.import_file(_workbook_bytes([
+            ["Ward and Vg", "villageName", "Extra"],
+            ["Vg", "Village", "x"],
+        ]))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("ကော်လံခေါင်းစဉ်", response.json()["detail"])
+
+    def test_import_accepts_no_in_any_order_but_requires_known_headers(self):
         self.sign_in()
 
         inverted = self.import_file(_workbook_bytes([
             ["villageName", "No."],
             ["Village", 1],
         ]))
-        self.assertEqual(inverted.status_code, 400)
-        self.assertIn("No.", inverted.json()["detail"])
+        self.assertEqual(inverted.status_code, 200, inverted.text)
+        self.assertEqual(inverted.json()["inserted"], 1)
 
         wrong_label = self.import_file(_workbook_bytes([
             ["Number", "villageName"],

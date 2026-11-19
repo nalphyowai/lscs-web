@@ -165,6 +165,64 @@
     .panel-head h6 i { color: #10b981; }
     .panel-body { padding: 15px; }
 
+    /* ================= ENTRY CARD / TABS ================= */
+    .entry-card { margin-bottom: 16px; }
+    .entry-tabs {
+        display: flex; align-items: stretch; gap: 4px;
+        padding: 8px 12px 0;
+        border-bottom: 1px solid #eef2f0;
+        background: linear-gradient(180deg, #f7fdfa 0%, #ffffff 100%);
+        border-radius: 14px 14px 0 0;
+    }
+    .entry-tab {
+        position: relative; border: 0; background: transparent;
+        padding: 9px 16px 11px;
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 0.76rem; font-weight: 800; color: #64748b;
+        cursor: pointer; border-radius: 9px 9px 0 0;
+        transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    .entry-tab i { color: #10b981; }
+    .entry-tab:hover { background: #f1fbf6; color: #047857; }
+    .entry-tab.active { background: #ecfdf5; color: #047857; }
+    .entry-tab.active::after {
+        content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px;
+        height: 2px; border-radius: 2px; background: #10b981;
+    }
+    .entry-pane { display: none; padding: 16px; }
+    .entry-pane.active { display: block; }
+    .entry-form-grid {
+        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px 18px;
+    }
+    .entry-row {
+        grid-column: 1 / -1;
+        display: grid; gap: 14px 18px;
+    }
+    .entry-row.location-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .entry-row.location-row.four-location { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .entry-form-grid .form-select:disabled {
+        background-color: #f1f5f3; color: #64748b; border-color: #e8eeeb;
+        cursor: not-allowed; opacity: 1;
+    }
+    .entry-form-grid .field-stack { margin-bottom: 0 !important; }
+    .name-field { min-width: 0; }
+    .entry-form-grid .village-alert,
+    .entry-form-grid .import-result,
+    .entry-form-grid .excel-guide { grid-column: 1 / -1; }
+    .entry-form-grid .village-alert,
+    .entry-form-grid .import-result { margin-top: 0; }
+    .entry-form-grid .excel-guide { margin-top: 0; padding-top: 12px; }
+    .entry-form-grid .btn-add-village {
+        grid-column: 1 / -1; width: auto; max-width: 280px; margin-top: 0;
+    }
+    .entry-actions {
+        grid-column: 1 / -1;
+        display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    }
+    .entry-actions .btn-import-excel,
+    .entry-actions .btn-sample-excel { flex: 0 0 200px; }
+
     .count-badge {
         display: inline-flex; align-items: center; gap: 4px;
         border-radius: 999px; padding: 3px 9px;
@@ -235,11 +293,37 @@
     }
     .id-note i { color: #0ea5e9; margin-top: 1px; flex-shrink: 0; }
 
-    /* ================= EXCEL IMPORT ================= */
-    .excel-actions {
-        display: flex; flex-wrap: wrap; gap: 8px;
-        margin-top: 10px;
+    /* ================= WARD / VILLAGE CODE FIELDS ================= */
+    .field-stack {
+        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
     }
+    .ward-options { display: flex; gap: 8px; }
+    .ward-option { position: relative; flex: 1 1 0; min-width: 0; cursor: pointer; }
+    .ward-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .ward-option span {
+        display: flex; align-items: center; justify-content: center; gap: 5px;
+        min-height: 40px; padding: 7px 10px; border-radius: 9px;
+        border: 1px solid #dfe8e4; background: #ffffff; color: #475569;
+        font-size: 0.78rem; font-weight: 700; line-height: 1.2;
+        transition: background-color 0.15s ease, border-color 0.15s ease,
+                    color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .ward-option input:checked + span {
+        background: #ecfdf5; border-color: #6ee7b7; color: #047857;
+        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.12);
+    }
+    .ward-option input:focus-visible + span {
+        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+    }
+    .optional-tag {
+        display: inline-flex; align-items: center;
+        background: #f1f5f3; color: #64748b;
+        border-radius: 999px; padding: 1px 6px;
+        font-size: 0.58rem; font-weight: 700; white-space: nowrap;
+    }
+
+    /* ================= EXCEL IMPORT ================= */
     .btn-import-excel {
         flex: 1 1 150px; border: 1px solid #bfe8d5; border-radius: 9px; min-height: 38px;
         padding: 7px 12px;
@@ -344,6 +428,27 @@
         line-height: 1.45;
     }
     .qv-name i { color: #10b981; font-size: 0.7rem; flex-shrink: 0; }
+    .village-code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.73rem; font-weight: 600; color: #334155;
+        overflow-wrap: anywhere;
+    }
+    .village-code.is-empty { color: #94a3b8; font-weight: 500; }
+    .ward-pill {
+        display: inline-flex; align-items: center;
+        border-radius: 999px; padding: 3px 9px;
+        background: #ecfdf5; border: 1px solid #a7f3d0;
+        color: #047857; font-size: 0.65rem; font-weight: 800;
+        white-space: nowrap;
+    }
+    .ward-pill.is-empty { background: #f1f5f3; border-color: #e2e8f0; color: #94a3b8; }
+
+    .success-modal-icon {
+        width: 58px; height: 58px; border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: #ecfdf5; border: 1px solid #a7f3d0;
+        color: #047857; font-size: 1.65rem;
+    }
 
     .table-state { text-align: center; padding: 34px 16px !important; }
     .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
@@ -432,6 +537,11 @@
         .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .filter-grid .filter-actions { grid-column: 1 / -1; justify-content: flex-end; }
     }
+    @media (max-width: 991.98px) {
+        .entry-form-grid { grid-template-columns: 1fr; }
+        .entry-row.location-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .entry-row.location-row.four-location { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     @media (max-width: 575.98px) {
         .village-hero { padding: 15px; }
         .hero-main { gap: 10px; }
@@ -447,6 +557,11 @@
         .btn-filter-submit, .btn-filter-reset { min-width: 0; width: 100%; }
         .filter-head-text .filter-sub { display: none; }
         .panel-body { padding: 13px; }
+        .field-stack { grid-template-columns: 1fr; }
+        .entry-row.location-row { grid-template-columns: 1fr; }
+        .entry-row.location-row.four-location { grid-template-columns: 1fr; }
+        .entry-actions .btn-import-excel,
+        .entry-actions .btn-sample-excel { flex: 1 1 100%; }
     }
 </style>
 {% endblock %}
@@ -489,6 +604,178 @@
         <span>{{ location_error }}</span>
     </div>
     {% endif %}
+
+    <div class="panel-card entry-card">
+        <div class="entry-tabs" role="tablist" aria-label="ကျေးရွာထည့်သွင်းနည်းများ">
+            <button type="button" class="entry-tab active" id="tabManualEntry"
+                    data-entry-target="paneManualEntry" role="tab"
+                    aria-selected="true" aria-controls="paneManualEntry">
+                <i class="bi bi-pencil-square"></i> ကိုယ်တိုင်ထည့်သွင်းမည်
+            </button>
+            <button type="button" class="entry-tab" id="tabExcelImport"
+                    data-entry-target="paneExcelImport" role="tab"
+                    aria-selected="false" aria-controls="paneExcelImport">
+                <i class="bi bi-file-earmark-excel-fill"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
+            </button>
+        </div>
+
+        <div class="entry-pane active" id="paneManualEntry" role="tabpanel" aria-labelledby="tabManualEntry">
+            <div class="add-intro">
+                <i class="bi bi-info-circle-fill"></i>
+                ကျေးရွာအုပ်စု ရွေးချယ်ပါ။ Ward သို့မဟုတ် Vg ကို ရွေးပြီး ကျေးရွာအမည် ဖြည့်ပါ။ ကျေးရွာကုဒ်ကို မသိပါက ဗလာထားနိုင်ပါသည်။
+            </div>
+
+            <form class="add-form entry-form-grid" id="addVillageForm" autocomplete="off">
+                <div class="entry-row location-row four-location">
+                    <div class="mb-0">
+                        <label class="form-label" for="addState"><i class="bi bi-geo-alt-fill"></i>တိုင်းဒေသကြီး/ပြည်နယ်</label>
+                        <select id="addState" class="form-select" disabled>
+                            <option>{{ state_name }}</option>
+                        </select>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="addDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင်</label>
+                        <select id="addDistrict" class="form-select" disabled>
+                            <option>{{ district_name }}</option>
+                        </select>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="addTownship"><i class="bi bi-building-fill"></i>မြို့နယ်</label>
+                        <select id="addTownship" class="form-select" disabled>
+                            <option>{{ township_name }}</option>
+                        </select>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="addQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
+                        <select id="addQv" class="form-select" required>
+                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
+                            {% for item in qvs %}
+                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="field-stack">
+                    <div>
+                        <label class="form-label"><i class="bi bi-diagram-2-fill"></i>ရပ်ကွက် / ကျေးရွာ <span class="req">*</span></label>
+                        <div class="ward-options" role="radiogroup" aria-label="Ward or Vg">
+                            <label class="ward-option">
+                                <input type="radio" name="wardOrVg" value="Ward" id="addWard">
+                                <span><i class="bi bi-building"></i>ရပ်ကွက်</span>
+                            </label>
+                            <label class="ward-option">
+                                <input type="radio" name="wardOrVg" value="Vg" id="addVg">
+                                <span><i class="bi bi-house"></i>ကျေးရွာ</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="form-label" for="villageCode">
+                            <i class="bi bi-upc-scan"></i>ကျေးရွာကုဒ်
+                            <span class="optional-tag">မသိပါက ဗလာထားနိုင်ပါသည်</span>
+                        </label>
+                        <input type="text" id="villageCode" class="form-control"
+                               maxlength="50" placeholder="ဥပမာ - 219161"
+                               {% if not qvs %}disabled{% endif %}>
+                    </div>
+                </div>
+
+                <div class="name-field">
+                    <label class="form-label" for="villageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
+                    <input type="text" id="villageName" name="villageName" class="form-control"
+                           maxlength="150" placeholder="ဥပမာ - ကန်ရိုးကျေးရွာ" required
+                           {% if not qvs %}disabled{% endif %}>
+                    <div class="name-hint">
+                        <i class="bi bi-translate"></i>
+                        <span>မြန်မာစာ သို့မဟုတ် English ဖြင့် ရေးသားနိုင်ပါသည်။ ကျေးရွာအမည် ထပ်နေပါက စနစ်မှ လက်မခံပါ။</span>
+                    </div>
+                </div>
+
+                <div id="addAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
+
+                <button type="submit" class="btn-add-village" id="btnAddVillage" {% if not qvs %}disabled{% endif %}>
+                    <i class="bi bi-plus-circle"></i>
+                    ကျေးရွာ ထည့်သွင်းမည်
+                </button>
+            </form>
+        </div>
+
+        <div class="entry-pane" id="paneExcelImport" role="tabpanel" aria-labelledby="tabExcelImport">
+            <div class="add-intro">
+                <i class="bi bi-info-circle-fill"></i>
+                Excel ဖိုင်ဖြင့် ကျေးရွာများကို တစ်ကြောင်းချင်း ထည့်စရာမလိုဘဲ တစ်ခါတည်း ထည့်သွင်းနိုင်ပါသည်။ နမူနာဖိုင်ကို ဒေါင်းလုဒ်လုပ်ပြီး ပြင်ဆင်နိုင်ပါသည်။
+            </div>
+
+            <form class="add-form entry-form-grid" id="villageImportForm" autocomplete="off">
+                <div class="entry-row location-row four-location">
+                    <div class="mb-0">
+                        <label class="form-label" for="importState"><i class="bi bi-geo-alt-fill"></i>တိုင်းဒေသကြီး/ပြည်နယ်</label>
+                        <select id="importState" class="form-select" disabled>
+                            <option>{{ state_name }}</option>
+                        </select>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="importDistrict"><i class="bi bi-signpost-split-fill"></i>ခရိုင်</label>
+                        <select id="importDistrict" class="form-select" disabled>
+                            <option>{{ district_name }}</option>
+                        </select>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="importTownship"><i class="bi bi-building-fill"></i>မြို့နယ်</label>
+                        <select id="importTownship" class="form-select" disabled>
+                            <option>{{ township_name }}</option>
+                        </select>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="importQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
+                        <select id="importQv" class="form-select" required>
+                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
+                            {% for item in qvs %}
+                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="mb-0">
+                    <label class="form-label" for="importFile"><i class="bi bi-file-earmark-excel-fill"></i>Excel ဖိုင် (.xlsx) <span class="req">*</span></label>
+                    <input type="file" id="importFile" class="form-control" accept=".xlsx" required {% if not qvs %}disabled{% endif %}>
+                    <div class="name-hint">
+                        <i class="bi bi-info-circle"></i>
+                        <span>ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအောက်တွင် Excel ဖိုင်၏ ကျေးရွာအမည်များကို ထည့်သွင်းပါမည်။</span>
+                    </div>
+                </div>
+
+                <div class="excel-guide">
+                    <div class="excel-guide-title"><i class="bi bi-list-check"></i> Excel ဖိုင် ပြင်ဆင်ပုံ</div>
+                    <ul>
+                        <li>ဖိုင်တွင် စာမျက်နှာ (sheet) တစ်ခုတည်း ပါဝင်ရမည်။</li>
+                        <li><code>villageName</code> နှင့် <code>Ward and Vg</code> ကော်လံများ ပါဝင်ရမည်။ <code>Ward/Village_ Pcode</code> ကော်လံကို မထည့်တော့ဘဲလည်း ရပါသည်။</li>
+                        <li><code>Ward and Vg</code> က အမျိုးအစား (ဥပမာ - <code>Vg</code>)၊ <code>Ward/Village_ Pcode</code> က ကုဒ် (ဥပမာ - <code>219161</code>) ဖြစ်ပါသည်။</li>
+                        <li><code>No.</code> က အစဉ်နံပါတ်သာ ဖြစ်ပြီး မထည့်လည်းရပါသည်။ villageID ကို စနစ်မှ အလိုအလျောက် သတ်မှတ်ပါသည်။</li>
+                        <li>ကော်လံ ၄ ခုအထိ လက်ခံပါသည်။ မူရင်း ၁ သို့မဟုတ် ၂ ကော်လံ (<code>No.</code>, <code>villageName</code>) ဖိုင်ဟောင်းများကိုလည်း ဆက်လက် လက်ခံပါသည်။</li>
+                        <li>ကျေးရွာအမည်နှင့် Ward and Vg ကော်လံများတွင် ဗလာ မထားရပါ။ Ward and Vg တွင် <code>Ward</code> သို့မဟုတ် <code>Vg</code> သာ ထည့်ပါ။</li>
+                        <li><code>Ward/Village_ Pcode</code> ကုဒ်ကို မသိပါက ဗလာထားနိုင်ပါသည်။ ကျေးရွာအသစ်ထည့်သည့်အခါလည်း ဗလာထားနိုင်ပါသည်။</li>
+                        <li>ကျေးရွာအုပ်စုအတွင်း ရှိပြီးသား ကျေးရွာအမည် သို့မဟုတ် Pcode များကို ကျော်လွှားမည်။</li>
+                        <li>ပထမတန်းသည် ကော်လံခေါင်းစဉ် ဖြစ်ရမည်။</li>
+                    </ul>
+                </div>
+
+                <div id="importAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
+                <div id="importResult" class="import-result d-none" aria-live="polite"></div>
+
+                <div class="entry-actions">
+                    <a class="btn-sample-excel" href="/api/township/villages/sample-excel">
+                        <i class="bi bi-download"></i> နမူနာ Excel ဖိုင်
+                    </a>
+                    <button type="submit" class="btn-import-excel" id="btnImportVillages">
+                        <i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
 
     <form method="GET" action="/township/villages" id="villageFilterForm">
         <div class="filter-card mb-3">
@@ -542,106 +829,46 @@
         </div>
     </form>
 
-    <div class="row g-3">
-        <div class="col-xl-4 col-lg-5">
-            <div class="panel-card">
-                <div class="panel-head">
-                    <h6><span class="add-card-accent"><i class="bi bi-plus-lg"></i></span> ကျေးရွာအသစ် ထည့်သွင်းရန်</h6>
-                </div>
-                <div class="panel-body">
-                    <div class="add-intro">
-                        <i class="bi bi-info-circle-fill"></i>
-                        ကျေးရွာအသစ် ထည့်သွင်းရန် ကျေးရွာအုပ်စု ရွေးချယ်ပြီး ကျေးရွာအမည်ကို ဖြည့်ပါ။
-                    </div>
-
-                    <form class="add-form" id="addVillageForm" autocomplete="off">
-                        <div class="mb-3">
-                            <label class="form-label" for="addQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
-                            <select id="addQv" class="form-select" required>
-                                <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
-                                {% for item in qvs %}
-                                <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
-                                {% endfor %}
-                            </select>
-                        </div>
-
-                        <div class="mb-0">
-                            <label class="form-label" for="villageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
-                            <input type="text" id="villageName" name="villageName" class="form-control"
-                                   maxlength="150" placeholder="ဥပမာ - ကန်ရိုးကျေးရွာ" required
-                                   {% if not qvs %}disabled{% endif %}>
-                            <div class="name-hint">
-                                <i class="bi bi-translate"></i>
-                                <span>မြန်မာစာ သို့မဟုတ် English ဖြင့် ရေးသားနိုင်ပါသည်။ ကျေးရွာအမည် ထပ်နေပါက စနစ်မှ လက်မခံပါ။</span>
-                            </div>
-                        </div>
-
-                        <div id="addAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
-
-                        <button type="submit" class="btn-add-village" id="btnAddVillage" {% if not qvs %}disabled{% endif %}>
-                            <i class="bi bi-plus-circle"></i>
-                            ကျေးရွာ ထည့်သွင်းမည်
-                        </button>
-                    </form>
-
-                    <div class="id-note">
-                        <!-- <i class="bi bi-upc-scan"></i> -->
-                        <span></span>
-                    </div>
-
-                    <div class="excel-actions">
-                        <button type="button" class="btn-import-excel" id="btnOpenImportExcel" {% if not qvs %}disabled{% endif %}>
-                            <i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်
-                        </button>
-                        <a class="btn-sample-excel" href="/api/township/villages/sample-excel">
-                            <i class="bi bi-download"></i> နမူနာ Excel ဖိုင်
-                        </a>
-                    </div>
-                </div>
-            </div>
+    <div class="panel-card list-card">
+        <div class="panel-head">
+            <h6>
+                <i class="bi bi-table"></i>
+                ကျေးရွာစာရင်း
+                <span class="count-badge" id="listCountBadge">{{ filtered_total }} ရွာ</span>
+            </h6>
+            <button type="button" class="btn-icon" id="refreshBtn" title="ပြန်လည်ရယူရန်">
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
         </div>
-
-        <div class="col-xl-8 col-lg-7">
-            <div class="panel-card list-card">
-                <div class="panel-head">
-                    <h6>
-                        <i class="bi bi-table"></i>
-                        ကျေးရွာစာရင်း
-                        <span class="count-badge" id="listCountBadge">{{ filtered_total }} ရွာ</span>
-                    </h6>
-                    <button type="button" class="btn-icon" id="refreshBtn" title="ပြန်လည်ရယူရန်">
-                        <i class="bi bi-arrow-clockwise"></i>
-                    </button>
-                </div>
-                <div class="table-responsive">
-                    <table class="village-table">
-                        <thead>
-                            <tr>
-                                <th>စဉ်</th>
-                                <th>ကျေးရွာအမည်</th>
-                                <th>ကျေးရွာအုပ်စု</th>
-                                <th class="text-center">လုပ်ဆောင်ချက်များ</th>
-                            </tr>
-                        </thead>
-                        <tbody id="villageTbody">
-                            <tr>
-                                <td colspan="4" class="table-state">
-                                    <div class="empty-state">
-                                        <div class="empty-icon"><i class="bi bi-house"></i></div>
-                                        <div class="empty-title">ကျေးရွာစာရင်း ဖွင့်နေသည်…</div>
-                                    </div>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div class="panel-foot d-none" id="villagePager">
-                    <span class="pager-info" id="pagerStatus"></span>
-                    <nav class="village-pager" aria-label="ကျေးရွာစာရင်း စာမျက်နှာ">
-                        <ul class="pagination pagination-sm mb-0" id="pagerList"></ul>
-                    </nav>
-                </div>
-            </div>
+        <div class="table-responsive">
+            <table class="village-table">
+                <thead>
+                    <tr>
+                        <th>စဉ်</th>
+                        <th>ကျေးရွာအမည်</th>
+                        <th>ကျေးရွာကုဒ်</th>
+                        <th>Ward/Vg</th>
+                        <th>ကျေးရွာအုပ်စု</th>
+                        <th class="text-center">လုပ်ဆောင်ချက်များ</th>
+                    </tr>
+                </thead>
+                <tbody id="villageTbody">
+                    <tr>
+                        <td colspan="6" class="table-state">
+                            <div class="empty-state">
+                                <div class="empty-icon"><i class="bi bi-house"></i></div>
+                                <div class="empty-title">ကျေးရွာစာရင်း ဖွင့်နေသည်…</div>
+                            </div>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="panel-foot d-none" id="villagePager">
+            <span class="pager-info" id="pagerStatus"></span>
+            <nav class="village-pager" aria-label="ကျေးရွာစာရင်း စာမျက်နှာ">
+                <ul class="pagination pagination-sm mb-0" id="pagerList"></ul>
+            </nav>
         </div>
     </div>
 </div>
@@ -664,6 +891,29 @@
                             <option value="{{ item.QVID }}">{{ item.QVName or item.QVID }}</option>
                             {% endfor %}
                         </select>
+                    </div>
+                    <div class="field-stack mb-3">
+                        <div>
+                            <label class="form-label"><i class="bi bi-diagram-2-fill"></i>Ward / Vg <span class="req">*</span></label>
+                            <div class="ward-options" role="radiogroup" aria-label="Ward or Vg">
+                                <label class="ward-option">
+                                    <input type="radio" name="editWardOrVg" value="Ward" id="editWard">
+                                    <span><i class="bi bi-building"></i>Ward</span>
+                                </label>
+                                <label class="ward-option">
+                                    <input type="radio" name="editWardOrVg" value="Vg" id="editVg">
+                                    <span><i class="bi bi-house"></i>Vg</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="form-label" for="editVillageCode">
+                                <i class="bi bi-upc-scan"></i>ကျေးရွာကုဒ်
+                                <span class="optional-tag">မသိပါက ဗလာထားနိုင်ပါသည်</span>
+                            </label>
+                            <input type="text" id="editVillageCode" class="form-control" maxlength="50"
+                                   placeholder="ဥပမာ - 219161">
+                        </div>
                     </div>
                     <div class="mb-0">
                         <label class="form-label" for="editVillageName"><i class="bi bi-house-fill"></i>ကျေးရွာအမည် <span class="req">*</span></label>
@@ -707,61 +957,19 @@
     </div>
 </div>
 
-<div class="modal fade" id="villageImportModal" tabindex="-1" aria-labelledby="villageImportModalLabel" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <form id="villageImportForm" autocomplete="off">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="villageImportModalLabel">
-                        <i class="bi bi-file-earmark-excel-fill me-2"></i>Excel ဖိုင်ဖြင့် ကျေးရွာ ထည့်သွင်းရန်
-                    </h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="ပိတ်မည်"></button>
-                </div>
-                <div class="modal-body">
-                    <div class="mb-3">
-                        <label class="form-label" for="importQv"><i class="bi bi-diagram-3-fill"></i>ကျေးရွာအုပ်စု <span class="req">*</span></label>
-                        <select id="importQv" class="form-select" required>
-                            <option value="">— ကျေးရွာအုပ်စု ရွေးချယ်ပါ —</option>
-                            {% for item in qvs %}
-                            <option value="{{ item.QVID }}" {% if item.QVID == selected_qv %}selected{% endif %}>{{ item.QVName or item.QVID }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="mb-0">
-                        <label class="form-label" for="importFile"><i class="bi bi-file-earmark-excel-fill"></i>Excel ဖိုင် (.xlsx) <span class="req">*</span></label>
-                        <input type="file" id="importFile" class="form-control" accept=".xlsx" required {% if not qvs %}disabled{% endif %}>
-                        <div class="name-hint">
-                            <i class="bi bi-info-circle"></i>
-                            <span>ရွေးချယ်ထားသော ကျေးရွာအုပ်စုအောက်တွင် Excel ဖိုင်၏ ကျေးရွာအမည်များကို ထည့်သွင်းပါမည်။</span>
-                        </div>
-                    </div>
-
-                    <div class="excel-guide">
-                        <div class="excel-guide-title"><i class="bi bi-list-check"></i> Excel ဖိုင် ပြင်ဆင်ပုံ</div>
-                        <ul>
-                            <li>ဖိုင်တွင် စာမျက်နှာ (sheet) တစ်ခုတည်း ပါဝင်ရမည်။</li>
-                            <li>ကော်လံ နှစ်ခုထက် မပိုရပါ။ ကော်လံ တစ်ခု (<code>villageName</code>) သို့မဟုတ် ကော်လံ နှစ်ခု (<code>No.</code> နှင့် <code>villageName</code>) ပါဝင်နိုင်သည်။</li>
-                            <li>ကော်လံ နှစ်ခုဖြစ်ပါက ပထမကော်လံမှာ <code>No.</code> (ကျေးရွာ အရေအတွက်) ဖြစ်ရမည်။</li>
-                            <li>ဒုတိယကော်လံမှာ <code>villageName</code> အတိအကျ ဖြစ်ရမည်။</li>
-                            <li>ကျေးရွာအမည် ကော်လံတွင် ဗလာ မထားရပါ။</li>
-                            <li>ကျေးရွာအုပ်စုအတွင်း ရှိပြီးသား ကျေးရွာအမည်များကို ကျော်လွှားမည်။</li>
-                            <li>ပထမတန်းသည် ကော်လံခေါင်းစဉ် ဖြစ်ရမည်။</li>
-                        </ul>
-                    </div>
-
-                    <div id="importAlert" class="village-alert d-none" role="alert" aria-live="polite"></div>
-                    <div id="importResult" class="import-result d-none" aria-live="polite"></div>
-                </div>
-                <div class="modal-footer">
-                    <a class="btn btn-light border me-auto" href="/api/township/villages/sample-excel">
-                        <i class="bi bi-download"></i> နမူနာဖိုင်
-                    </a>
-                    <button type="button" class="btn btn-light border" data-bs-dismiss="modal">မလုပ်တော့ပါ</button>
-                    <button type="submit" class="btn btn-success" id="btnImportVillages">
-                        <i class="bi bi-upload"></i> ထည့်သွင်းမည်
-                    </button>
-                </div>
-            </form>
+<div class="modal fade" id="villageDeleteSuccessModal" tabindex="-1" aria-labelledby="villageDeleteSuccessModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-sm">
+        <div class="modal-content text-center">
+            <div class="modal-body p-4">
+                <div class="success-modal-icon"><i class="bi bi-check-circle-fill"></i></div>
+                <h5 class="modal-title mt-3 mb-2" id="villageDeleteSuccessModalLabel">ကျေးရွာ ဖျက်ပြီးပါပြီ</h5>
+                <p class="mb-0 text-muted" id="deleteSuccessMessage"></p>
+            </div>
+            <div class="modal-footer border-0 justify-content-center pb-3">
+                <button type="button" class="btn btn-success" data-bs-dismiss="modal">
+                    <i class="bi bi-check2"></i> နားလည်ပါသည်
+                </button>
+            </div>
         </div>
     </div>
 </div>
@@ -788,6 +996,7 @@
     const addForm = document.getElementById('addVillageForm');
     const addQv = document.getElementById('addQv');
     const nameInput = document.getElementById('villageName');
+    const villageCodeInput = document.getElementById('villageCode');
     const addAlert = document.getElementById('addAlert');
     const addBtn = document.getElementById('btnAddVillage');
     const tbody = document.getElementById('villageTbody');
@@ -801,20 +1010,23 @@
     const editForm = document.getElementById('villageEditForm');
     const editQv = document.getElementById('editQv');
     const editVillageName = document.getElementById('editVillageName');
+    const editVillageCode = document.getElementById('editVillageCode');
     const editAlert = document.getElementById('editAlert');
     const editSaveBtn = document.getElementById('btnSaveVillageEdit');
     const deleteModalEl = document.getElementById('villageDeleteModal');
     const deleteNameEl = document.getElementById('deleteVillageName');
     const deleteAlert = document.getElementById('deleteAlert');
     const deleteConfirmBtn = document.getElementById('btnConfirmDeleteVillage');
-    const importModalEl = document.getElementById('villageImportModal');
+    const deleteSuccessModalEl = document.getElementById('villageDeleteSuccessModal');
+    const deleteSuccessMessage = document.getElementById('deleteSuccessMessage');
+    const entryTabs = Array.from(document.querySelectorAll('.entry-tab'));
+    const excelEntryTab = document.getElementById('tabExcelImport');
     const importForm = document.getElementById('villageImportForm');
     const importQv = document.getElementById('importQv');
     const importFile = document.getElementById('importFile');
     const importAlert = document.getElementById('importAlert');
     const importResult = document.getElementById('importResult');
     const importBtn = document.getElementById('btnImportVillages');
-    const openImportBtn = document.getElementById('btnOpenImportExcel');
 
     let totalVillages = Number(dataEl.dataset.totalVillages || 0);
     let totalFiltered = Number(dataEl.dataset.filteredTotal || 0);
@@ -834,10 +1046,63 @@
 
     const ADD_BUTTON_HTML = '<i class="bi bi-plus-circle"></i> ကျေးရွာ ထည့်သွင်းမည်';
     const ADD_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ထည့်သွင်းနေသည်…';
-    const IMPORT_BUTTON_HTML = '<i class="bi bi-upload"></i> ထည့်သွင်းမည်';
+    const IMPORT_BUTTON_HTML = '<i class="bi bi-upload"></i> Excel ဖိုင်ဖြင့် ထည့်သွင်းမည်';
     const IMPORT_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ထည့်သွင်းနေသည်…';
     const DELETE_BUTTON_HTML = '<i class="bi bi-trash"></i> ဖျက်မည်';
     const DELETE_BUTTON_BUSY = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ဖျက်နေသည်…';
+
+    function selectedWard(form, name) {
+        const checked = form && form.querySelector(
+            'input[name="' + name + '"]:checked'
+        );
+        return checked ? checked.value : '';
+    }
+
+    function setWard(form, name, value) {
+        if (!form) return;
+        form.querySelectorAll('input[name="' + name + '"]').forEach(function (radio) {
+            radio.checked = radio.value === String(value || '');
+        });
+    }
+
+    function setupEntryTabs() {
+        entryTabs.forEach(function (tab) {
+            tab.addEventListener('click', function () {
+                const targetId = tab.dataset.entryTarget;
+                entryTabs.forEach(function (other) {
+                    const isActive = other === tab;
+                    other.classList.toggle('active', isActive);
+                    other.setAttribute('aria-selected', isActive ? 'true' : 'false');
+                });
+                document.querySelectorAll('.entry-pane').forEach(function (pane) {
+                    pane.classList.toggle('active', pane.id === targetId);
+                });
+                if (tab === excelEntryTab) prepareImportForm();
+            });
+        });
+    }
+
+    function showDeleteSuccess(message) {
+        if (deleteSuccessMessage) {
+            deleteSuccessMessage.textContent = message
+                || 'ကျေးရွာကို အောင်မြင်စွာ ဖျက်ပြီးပါပြီ။';
+        }
+        if (!deleteSuccessModalEl || !window.bootstrap) return;
+
+        const showModal = function () {
+            window.bootstrap.Modal.getOrCreateInstance(deleteSuccessModalEl).show();
+        };
+        // Wait for the confirmation dialog to finish closing before showing
+        // the success dialog, so the two backdrops do not overlap.
+        const deleteModal = deleteModalEl
+            ? window.bootstrap.Modal.getInstance(deleteModalEl)
+            : null;
+        if (deleteModal) {
+            deleteModalEl.addEventListener('hidden.bs.modal', showModal, { once: true });
+        } else {
+            showModal();
+        }
+    }
 
     function updateTotal(value) {
         totalVillages = Math.max(0, Number(value) || 0);
@@ -852,7 +1117,7 @@
     function tableStateRow(iconClass, title, text, extraClass) {
         const tr = document.createElement('tr');
         const td = document.createElement('td');
-        td.colSpan = 4;
+        td.colSpan = 6;
         td.className = 'table-state ' + (extraClass || '');
 
         const wrap = document.createElement('div');
@@ -933,6 +1198,18 @@
             nameSpan.textContent = row.villageName || '—';
             nameTd.appendChild(nameSpan);
 
+            const codeTd = document.createElement('td');
+            const codeSpan = document.createElement('span');
+            codeSpan.className = 'village-code' + (row.villageCode ? '' : ' is-empty');
+            codeSpan.textContent = row.villageCode || '—';
+            codeTd.appendChild(codeSpan);
+
+            const wardTd = document.createElement('td');
+            const wardPill = document.createElement('span');
+            wardPill.className = 'ward-pill' + (row.wardOrVg ? '' : ' is-empty');
+            wardPill.textContent = row.wardOrVg || '—';
+            wardTd.appendChild(wardPill);
+
             const qvTd = document.createElement('td');
             const qvSpan = document.createElement('span');
             qvSpan.className = 'qv-name';
@@ -969,6 +1246,8 @@
 
             tr.appendChild(noTd);
             tr.appendChild(nameTd);
+            tr.appendChild(codeTd);
+            tr.appendChild(wardTd);
             tr.appendChild(qvTd);
             tr.appendChild(actionTd);
             fragment.appendChild(tr);
@@ -1202,17 +1481,9 @@
         importResult.classList.remove('d-none');
     }
 
-    function openImportModal() {
-        clearImportAlert();
-        clearImportResult();
-        if (importFile) importFile.value = '';
-        if (importQv) {
-            const preferred = (addQv && addQv.value) || activeQv || '';
-            if (preferred) importQv.value = preferred;
-        }
-        if (importModalEl && window.bootstrap) {
-            window.bootstrap.Modal.getOrCreateInstance(importModalEl).show();
-        }
+    function prepareImportForm() {
+        const preferred = (addQv && addQv.value) || activeQv || '';
+        if (importQv && preferred) importQv.value = preferred;
     }
 
     function clearEditAlert() {
@@ -1243,6 +1514,8 @@
         editingVillage = row || null;
         if (editQv) editQv.value = row.QVID || '';
         if (editVillageName) editVillageName.value = row.villageName || '';
+        if (editVillageCode) editVillageCode.value = row.villageCode || '';
+        setWard(editForm, 'editWardOrVg', row.wardOrVg);
         clearEditAlert();
 
         if (editModalEl && window.bootstrap) {
@@ -1319,7 +1592,7 @@
             }
 
             pendingDelete = null;
-            showAddAlert('success', payload.message || 'ကျေးရွာကို ဖျက်ပြီးပါပြီ။');
+            showDeleteSuccess(payload.message || 'ကျေးရွာကို အောင်မြင်စွာ ဖျက်ပြီးပါပြီ။');
             updateTotal(Math.max(0, totalVillages - 1));
             await loadVillages(activeQv, currentPage, true);
         } catch (err) {
@@ -1368,6 +1641,8 @@
 
             const qv = addQv ? addQv.value : '';
             const name = nameInput ? nameInput.value.trim() : '';
+            const ward = selectedWard(addForm, 'wardOrVg');
+            const code = villageCodeInput ? villageCodeInput.value.trim() : '';
 
             if (!qv) {
                 showAddAlert('warning', 'ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။');
@@ -1379,8 +1654,17 @@
                 if (nameInput) nameInput.focus();
                 return;
             }
+            if (!ward) {
+                showAddAlert('warning', 'Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။');
+                const firstWard = addForm
+                    ? addForm.querySelector('input[name="wardOrVg"]')
+                    : null;
+                if (firstWard) firstWard.focus();
+                return;
+            }
 
             if (nameInput) nameInput.disabled = true;
+            if (villageCodeInput) villageCodeInput.disabled = true;
             if (addQv) addQv.disabled = true;
             setAddBusy(true);
 
@@ -1392,7 +1676,12 @@
                         'Accept': 'application/json',
                         'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
                     },
-                    body: new URLSearchParams({ qv: qv, villageName: name })
+                    body: new URLSearchParams({
+                        qv: qv,
+                        villageName: name,
+                        wardOrVg: ward,
+                        villageCode: code
+                    })
                 });
 
                 let payload = {};
@@ -1411,6 +1700,7 @@
                 updateTotal(totalVillages + 1);
 
                 if (nameInput) nameInput.value = '';
+                if (villageCodeInput) villageCodeInput.value = '';
                 if (addQv) addQv.value = created.QVID || qv;
                 if (filterQv) filterQv.value = created.QVID || qv;
 
@@ -1420,6 +1710,7 @@
                 showAddAlert('danger', err && err.message ? err.message : 'ကျေးရွာ ထည့်သွင်းမရပါ။');
             } finally {
                 if (nameInput) nameInput.disabled = false;
+                if (villageCodeInput) villageCodeInput.disabled = false;
                 if (addQv) addQv.disabled = false;
                 setAddBusy(false);
             }
@@ -1434,6 +1725,8 @@
 
             const newQv = editQv ? editQv.value : '';
             const newName = editVillageName ? editVillageName.value.trim() : '';
+            const newWard = selectedWard(editForm, 'editWardOrVg');
+            const newCode = editVillageCode ? editVillageCode.value.trim() : '';
 
             if (!newQv) {
                 showEditAlert('warning', 'ကျေးရွာအုပ်စု တစ်ခု ရွေးချယ်ပါ။');
@@ -1443,6 +1736,14 @@
             if (!newName) {
                 showEditAlert('warning', 'ကျေးရွာအမည် ထည့်သွင်းပါ။');
                 if (editVillageName) editVillageName.focus();
+                return;
+            }
+            if (!newWard) {
+                showEditAlert('warning', 'Ward သို့မဟုတ် Vg ကို ရွေးချယ်ပါ။');
+                const firstWard = editForm
+                    ? editForm.querySelector('input[name="editWardOrVg"]')
+                    : null;
+                if (firstWard) firstWard.focus();
                 return;
             }
 
@@ -1462,7 +1763,12 @@
                             'Accept': 'application/json',
                             'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
                         },
-                        body: new URLSearchParams({ qv: newQv, villageName: newName })
+                        body: new URLSearchParams({
+                            qv: newQv,
+                            villageName: newName,
+                            wardOrVg: newWard,
+                            villageCode: newCode
+                        })
                     }
                 );
 
@@ -1496,7 +1802,7 @@
     if (editVillageName) editVillageName.addEventListener('input', clearEditAlert);
     if (editQv) editQv.addEventListener('change', clearEditAlert);
 
-    if (openImportBtn) openImportBtn.addEventListener('click', openImportModal);
+    setupEntryTabs();
     if (importQv) importQv.addEventListener('change', clearImportAlert);
     if (importFile) {
         importFile.addEventListener('change', function () {
